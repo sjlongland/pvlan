@@ -20,6 +20,9 @@ description = "Private Layer-2 multicast VPN"
 dependencies = [
     "pycose"
 ]
+# Python 3.7.4+ required due to
+# https://github.com/python/cpython/commit/19ca5b500af4b66e1082a03d8fbf448e1f56af30
+requires-python = ">=3.7.4"
 
 [project.readme]
 file = "README.md"
