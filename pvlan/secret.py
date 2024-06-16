@@ -5,7 +5,7 @@ Secret handling functions, for keeping secrets out of logs!
 """
 
 # © 2024 Stuart Longland
-# SPDX-License-Identifier: AGPL-3.0
+# SPDX-License-Identifier: AGPL-3.0-or-later
 
 import os
 import hashlib

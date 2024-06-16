@@ -5,7 +5,7 @@ Key input/output, derivation and utility routines
 """
 
 # © 2024 Stuart Longland
-# SPDX-License-Identifier: AGPL-3.0
+# SPDX-License-Identifier: AGPL-3.0-or-later
 
 import weakref
 import hashlib
