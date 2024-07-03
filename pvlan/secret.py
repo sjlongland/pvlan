@@ -33,7 +33,7 @@ class SaltedSecret(object):
     ):
         self._hashedsecret = hashedsecret
         self._sep = sep
-        self._sepbytes = self._sepbytes
+        self._sepbytes = sepbytes
 
     @property
     def sep(self):
