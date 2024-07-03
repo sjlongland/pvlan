@@ -5,6 +5,8 @@ MAC Address routines.  This module provides code that can generate randomised
 MAC addresses and MAC OUIs to ensure each node has a controlled unique
 address.
 """
+# © 2024 Stuart Longland
+# SPDX-License-Identifier: AGPL-3.0-or-later
 
 import os
 import re
