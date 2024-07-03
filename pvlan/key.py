@@ -44,7 +44,15 @@ class SafeSecret(object):
 
     def __init__(self, key):
         self._key = key
+        self._ident = PRIVKEY_HASH_FN(self)
         self._repr = None
+
+    @property
+    def ident(self):
+        """
+        Return the key identity (salted hash of the secret)
+        """
+        return bytes(self._ident)
 
     @property
     def key(self):
@@ -77,7 +85,7 @@ class SafeSecret(object):
     def _get_repr(self):
         return "%s(%s)" % (
             self.__class__.__name__,
-            PRIVKEY_HASH_FN(self),
+            self._ident,
         )
 
 
