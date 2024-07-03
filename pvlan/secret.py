@@ -79,7 +79,7 @@ def saltedsecret(
             password=bytes(p),
             salt=salt,
             iterations=iterations,
-        )[:-length],
+        )[-length:],
         sep=sep,
         sepbytes=sepbytes,
     )
