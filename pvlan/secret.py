@@ -53,6 +53,9 @@ class SaltedSecret(object):
     def __bytes__(self):
         return self._hashedsecret
 
+    def __hash__(self):
+        return hash(bytes(self))
+
     def __repr__(self):
         return bytes(self).hex(self.sep, self.sepbytes)
 
