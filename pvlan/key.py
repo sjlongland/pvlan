@@ -310,7 +310,7 @@ class SafeDerivedKey(SafeSecret):
     DERIVED_KEY_SZ = 32
 
     # Lower-case, for consistency with hashlib!
-    HASH_ALGO = "sha256"
+    HASH_ALGO = SALTED_SECRET_HASH_NAME
 
     @classmethod
     def generate(
@@ -384,7 +384,7 @@ class SafeX25519PrivateKey(PrivateKeyMixin, SafeSecret):
     DERIVED_KEY_SZ = 32
 
     # Lower-case, for consistency with hashlib!
-    HASH_ALGO = "sha256"
+    HASH_ALGO = SALTED_SECRET_HASH_NAME
 
     @classmethod
     def generate(cls):
