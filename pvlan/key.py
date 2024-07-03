@@ -328,7 +328,7 @@ class SafeDerivedKey(SafeSecret):
         Using the given information, derive a shared secret.
         """
         # Retrieve the algorithm
-        algorithm = getattr(hashes, algorithm.upper())
+        algorithm = getattr(hashes, algorithm.upper())()
 
         # Cast or generate salt and info
         salt = SafeRandomSecret.cast_or_generate(salt, salt_sz)
