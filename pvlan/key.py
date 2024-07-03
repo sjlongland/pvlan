@@ -313,6 +313,25 @@ class SafeDerivedKey(SafeSecret):
         # Return a wrapped key
         return cls(key=key, salt=salt, info=info)
 
+    def __init__(self, key, salt, info):
+        super().__init__(key=key)
+        self._salt = salt
+        self._info = info
+
+    @property
+    def salt(self):
+        """
+        Return the salt used to generate this shared key.
+        """
+        return self._salt
+
+    @property
+    def info(self):
+        """
+        Return the info field used to generate this shared key.
+        """
+        return self._info
+
     def as_cose_key(self, *ops):
         """
         Return this key as a COSE symmetric key for the given operations.
