@@ -32,6 +32,11 @@ PRIVKEY_HASH_FN = saltedsecret()
 DEFAULT_CURVE = "ED25519"
 
 
+# References to every secret by identity.  So we can ensure the same ident
+# never references two different secrets!
+_SECRETS = weakref.WeakValueDictionary()
+
+
 class SafeSecret(object):
     """
     A wrapper around a raw secret to ensure safe usage.  Specifically,
@@ -44,8 +49,8 @@ class SafeSecret(object):
 
     def __init__(self, key):
         self._key = key
-        self._ident = PRIVKEY_HASH_FN(self)
         self._repr = None
+        self._ident = self._gen_ident()
 
     @property
     def ident(self):
@@ -87,6 +92,28 @@ class SafeSecret(object):
             self.__class__.__name__,
             self._ident,
         )
+
+    def _gen_ident(self):
+        """
+        Generate a unique ident for this secret.
+        """
+        ident = PRIVKEY_HASH_FN(self)
+        while ident in _SECRETS:
+            # It matches an existing secret, is it the same?
+            match = _SECRETS[ident]
+            if bytes(match) == bytes(self):
+                # It's the same secret, stop here
+                break
+
+            # Different secret!  Ookay, we need to add some more entropy!
+            # Add 64 bits of random data for the hash and try again.
+            ident = PRIVKEY_HASH_FN(bytes(self) + os.urandom(8))
+
+        # Claim this identity (NB: we may also overwrite identical secrets)
+        _SECRETS[ident] = self
+
+        # Return the discovered identity.
+        return ident
 
 
 class PrivateKeyMixin(object):
