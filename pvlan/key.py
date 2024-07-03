@@ -21,7 +21,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 )
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from .secret import saltedsecret
+from .secret import saltedsecret, SALTED_SECRET_HASH_NAME
 
 
 # Functions for hashing public and private keys
@@ -128,7 +128,7 @@ class PrivateKeyMixin(object):
     @property
     def fingerprint(self):
         """
-        Return the key fingerprint for this key pair (SHA-256 hash of the
+        Return the key fingerprint for this key pair (SHA3-512 hash of the
         public key).
         """
         return self.public.fingerprint
@@ -167,10 +167,10 @@ class PublicKeyMixin(object):
     @property
     def fingerprint(self):
         """
-        Return the key fingerprint for this public key (SHA-256 hash).
+        Return the key fingerprint for this public key (SHA3-512 hash).
         """
         if self._fingerprint is None:
-            h = hashlib.sha256()
+            h = hashlib.new(SALTED_SECRET_HASH_NAME)
             h.update(bytes(self))
             self._fingerprint = h.digest()
         return self._fingerprint
@@ -187,7 +187,7 @@ class PublicKeyMixin(object):
 
     def _get_repr(self):
         """
-        Return a truncated SHA-256 hash of the public key for display
+        Return a truncated SHA3-512 hash of the public key for display
         purposes.  Not salted because public keys are not sensitive.
         """
         return "%s(%s)" % (
