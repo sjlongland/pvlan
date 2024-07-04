@@ -49,7 +49,7 @@ class Signal(object):
         """
         Emit a signal to all listeners.
         """
-        listeners = list(self._listeners)
+        listeners = list(self._listeners.values())
         for listener in listeners:
             self._emit_to(listener, args, kwargs)
 
