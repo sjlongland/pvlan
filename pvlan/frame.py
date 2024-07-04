@@ -514,12 +514,12 @@ class VLANEthernetPayload(EthernetPayload):
         Return the bytes for encoding the VLAN tag field.
         """
         tagvalue = (
-            ((priority << self.VLAN_PRI_POS) & self.VLAN_PRI)
+            ((self.priority << self.VLAN_PRI_POS) & self.VLAN_PRI)
             | (self.VLAN_DEI if self.dei else 0)
             | (self.vlan_id & self.VLAN_MASK)
         )
 
-        return bytes([(tagvalue & 0xFF00) << 8, tagvalue & 0x00FF])
+        return bytes([(tagvalue & 0xFF00) >> 8, tagvalue & 0x00FF])
 
     def __bytes__(self):
         """
