@@ -132,7 +132,7 @@ class MAC(object):
     NODEADDR_LEN = 3
 
     @classmethod
-    def parse(cls, mac):
+    def parse(cls, mac, reserve=False, register=True):
         """
         Parse a MAC from a text or byte string.
         """
@@ -140,9 +140,11 @@ class MAC(object):
             # str → bytes
             mac = cls.decodestr(mac)
 
-        if isinstance(mac, bytes):
+        elif not isinstance(mac, cls):
             # bytes → int
-            mac = cls.decodebytes(mac)
+            mac = cls.fromint(
+                cls.decodebytes(mac), reserve=reserve, register=register
+            )
 
         return mac
 
@@ -198,8 +200,15 @@ class MAC(object):
         """
         Construct a MAC from a byte string.
         """
-        intmac = cls.decodebytes(bytesmac)
+        return cls.fromint(
+            cls.decodebytes(bytesmac), reserve=reserve, register=register
+        )
 
+    @classmethod
+    def fromint(cls, intmac, reserve=False, register=True):
+        """
+        Construct a MAC from an integer.
+        """
         # Peel off the OUI
         intoui = intmac >> OUI_POS
         intmac &= NODEADDR_MASK_ALL
