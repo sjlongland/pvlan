@@ -79,7 +79,7 @@ class Ethertype(EthertypeMixin, enum.Enum):
     - Steve Whitehouse, <gw7rrm@eeshack3.swan.ac.uk>
     et all.
 
-    https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/linux/if_ether.h
+    https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/uapi/linux/if_ether.h
     """
 
     @classmethod
