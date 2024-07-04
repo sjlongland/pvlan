@@ -324,6 +324,15 @@ class Ethertype(EthertypeMixin, enum.Enum):
 
 
 class EthernetPayload(object):
+    """
+    EthernetPayload is a base class that stores the Ethertype header field
+    along with the payload data for the frame.  This is used in particular
+    with IEEE 802.1Q, which whilst normally not nested in practice, can be
+    nested up to the MTU limits of the underlying link.
+
+    The base class is used to represent all generic protocols, with a specific
+    sub-class for handling VLANs.
+    """
 
     @staticmethod
     def decode(framedata):
@@ -583,4 +592,54 @@ class EthernetFrame(object):
             self.dest_mac,
             self.src_mac,
             self.payload,
+        )
+
+    @property
+    def is_vlan(self):
+        """
+        Return true if this frame is 802.1Q VLAN tagged.
+        """
+        return self.payload.proto == Ethertype.ETH_P_8021Q
+
+    def to_vlan(self, vlan_id, priority=0, dei=False, nest=False):
+        """
+        Generate a frame that sends this traffic via a specific VLAN.
+        This creates or re-writes the outer-most VLAN tag to route this
+        frame to the nominated VLAN.
+        """
+        payload = self.payload
+
+        if self.is_vlan:
+            # We already have a tagged frame
+            if not nest:
+                # Strip the VLAN layer
+                payload = payload.payload
+
+        # Wrap this in a new VLAN payload
+        payload = VLANEthernetPayload(
+            priority=priority,
+            dei=dei,
+            vlan_id=vlan_id,
+            payload=payload,
+        )
+
+        # Construct a new frame around the payload
+        return EthernetFrame(
+            dest_mac=self.dest_mac, src_mac=self.src_mac, payload=payload
+        )
+
+    def drop_vlan(self):
+        """
+        Drop the outermost VLAN layer.  Returns the same frame if the frame
+        is not VLAN-tagged.
+        """
+        if not self.is_vlan:
+            # Nothing to do
+            return self
+
+        # Construct a new frame around the payload
+        return EthernetFrame(
+            dest_mac=self.dest_mac,
+            src_mac=self.src_mac,
+            payload=self.payload.payload,
         )
