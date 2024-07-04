@@ -16,6 +16,7 @@ import asyncio
 import logging
 
 from .signal import AsyncSignal
+from .frame import EthernetFrame
 from .mac import MAC
 
 # Byte definitions
@@ -197,10 +198,17 @@ class SixLowHAMAgent(object):
             self.connected.emit(agent=self)
 
         elif frametype == FS:
+            # Frame data received:
+            # This will be a struct ethhdr, followed by the actual frame data.
+            #
+            # - struct ethhdr:
+            #   h_dest: u8[6]
+            #   h_source: u8[6]
+            #   h_proto: u16be
+
             self._log.debug("Received frame: %s", framedata.hex())
             try:
-                # TODO: implement parser
-                etherframe = framedata
+                etherframe = EthernetFrame.decode(framedata)
             except:
                 self._log.exception("Failed to parse frame %r", framedata)
                 self._send_frame(NAK)
