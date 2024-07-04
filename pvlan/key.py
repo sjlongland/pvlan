@@ -216,6 +216,17 @@ class SafeCOSESymmetricKey(SafeCOSEKeyWrapper):
     A wrapped symmetric COSE key.
     """
 
+    KEY_LENGTH_128 = 16
+    KEY_LENGTH_192 = 24
+    KEY_LENGTH_256 = 32
+
+    @classmethod
+    def generate(cls, length, *ops):
+        """
+        Generate a symmetric key from random data of the expected length.
+        """
+        return cls.from_bytes(os.urandom(length), *ops)
+
     @classmethod
     def from_bytes(cls, keydata, *ops):
         """
