@@ -274,12 +274,11 @@ class SafeOKPPublicKey(PublicKeyMixin, SafeCOSEKeyWrapper):
     pass
 
 
-def load_cose_key(path):
+def import_cose_key(keydata):
     """
-    Load a COSE-formatted key from a file.
+    Load a COSE-formatted key from a byte string.
     """
-    with open(path, "rb") as f:
-        key = CoseKey.decode(f.read())
+    key = CoseKey.decode(keydata)
 
     if key.kty == keytype.KtyOKP:
         # OKP key
@@ -296,6 +295,14 @@ def load_cose_key(path):
     #   TODO: implement EC2 if needed
     else:
         raise NotImplementedError("%s not supported" % key.kty)
+
+
+def load_cose_key(path):
+    """
+    Load a COSE-formatted key from a file.
+    """
+    with open(path, "rb") as f:
+        return import_cose_key(f.read())
 
 
 # X25519 key routines and classes, no loader for these because we never
