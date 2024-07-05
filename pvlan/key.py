@@ -1120,6 +1120,7 @@ class SafeCOSESymmetricKey(SafeCOSEKeyWrapper):
         iv_sz=16,
         phdr=None,
         uhdr=None,
+        kid=None,
     ):
         """
         Generate a ENC0 message encrypted using this symmetric key.
@@ -1131,11 +1132,21 @@ class SafeCOSESymmetricKey(SafeCOSEKeyWrapper):
 
         # Construct the protected header
         _phdr = {Algorithm: algorithm, IV: bytes(iv)}
+
         if phdr is not None:
             _phdr.update(phdr)
 
+        if kid is not None:
+            # Construct a uhdr
+            _uhdr = {KID: bytes(kid)}
+
+            if uhdr is not None:
+                _uhdr.update(uhdr)
+        else:
+            _uhdr = uhdr
+
         # Construct the message
-        msg = Enc0Message(phdr=_phdr, uhdr=uhdr, payload=payload)
+        msg = Enc0Message(phdr=_phdr, uhdr=_uhdr, payload=payload)
         msg.key = self.key
         return msg.encode()
 
@@ -1150,7 +1161,9 @@ class SafeCOSESymmetricKey(SafeCOSEKeyWrapper):
         msg.key = self.key
         return msg.decrypt()
 
-    def generate_mac0(self, payload, algorithm=HMAC256, phdr=None, uhdr=None):
+    def generate_mac0(
+        self, payload, algorithm=HMAC256, phdr=None, uhdr=None, kid=None
+    ):
         """
         Generate a MAC0 message keyed using this symmetric key.
         """
@@ -1159,8 +1172,17 @@ class SafeCOSESymmetricKey(SafeCOSEKeyWrapper):
         if phdr is not None:
             _phdr.update(phdr)
 
+        if kid is not None:
+            # Construct a uhdr
+            _uhdr = {KID: bytes(kid)}
+
+            if uhdr is not None:
+                _uhdr.update(uhdr)
+        else:
+            _uhdr = uhdr
+
         # Construct the message
-        msg = Mac0Message(phdr=_phdr, uhdr=uhdr, payload=payload)
+        msg = Mac0Message(phdr=_phdr, uhdr=_uhdr, payload=payload)
         msg.key = self.key
         return msg.encode()
 
@@ -1201,12 +1223,16 @@ class SafeOKPPrivateKey(PrivateKeyMixin, SafeCOSEKeyWrapper):
             private=self,
         )
 
-    def generate_sign1(self, payload, phdr=None, uhdr=None):
+    def generate_sign1(self, payload, phdr=None, uhdr=None, kid=None):
         """
         Generate a COSE Sign1 message using this private key.
         """
         # Construct the protected header
         _phdr = {Algorithm: EdDSA}
+
+        if kid is not None:
+            _phdr[KID] = bytes(kid)
+
         if phdr is not None:
             _phdr.update(phdr)
 
