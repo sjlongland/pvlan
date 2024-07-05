@@ -88,6 +88,14 @@ class KeyID(object):
     KID_LEN = NODE_ID_LEN + PURPOSE_LEN + FINGERPRINT_LEN
 
     @classmethod
+    def parse(cls, kidstr):
+        """
+        Decode a key ID from the text string
+        """
+        (uuidstr, kidhex, fphex) = kidstr.rsplit("-", 2)
+        return cls(uuid.UUID(uuidstr), int(kidhex, 16), bytes.fromhex(fphex))
+
+    @classmethod
     def decode(cls, kidbytes):
         """
         Decode a key ID from the byte string
@@ -149,6 +157,16 @@ class KeyID(object):
             self.owner_uuid.bytes
             + bytes([self.purpose.value])
             + self.fingerprint
+        )
+
+    def __str__(self):
+        """
+        Return a string representation of the key ID
+        """
+        return ("%s-%02x-%s") % (
+            self.owner_uuid,
+            self.purpose.value,
+            self.fingerprint.hex(),
         )
 
     def __repr__(self):
