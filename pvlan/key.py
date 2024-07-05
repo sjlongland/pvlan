@@ -270,12 +270,10 @@ class CertifiedObject(object):
             )
 
         # cert.pubkey is the SafeOKPPublicKey that signed the cert
-        self._certobject.key = cert.pubkey.key
-        if self._certobject.verify_signature():
-            # All checks out
-            self._signed_pubkey = cert
-        else:
-            raise ValueError("Bad signature in %r" % self)
+        cert.pubkey.key.validate_sign1(self._certobject)
+
+        # All checks out
+        self._signed_pubkey = cert
 
     def validate_chain(self, keystore):
         """
@@ -596,15 +594,8 @@ class CertificationKeypair(Keypair):
         # Construct the certificate payload
         payload = cbor2.dumps(payload)
 
-        # Construct the protected header
-        phdr = {Algorithm: EdDSA, KID: bytes(kid)}
-
-        # Construct the message
-        msg = Sign1Message(phdr=phdr, payload=payload)
-        msg.key = privkey.key
-
-        # Encode
-        encoded = msg.encode()
+        # Encode and sign the payload
+        encoded = privkey.generate_sign1(payload, phdr={KID: bytes(kid)})
 
         # Return the decoded certificate to sanity check
         return decoder(encoded)
@@ -1140,13 +1131,47 @@ class SafeOKPPrivateKey(PrivateKeyMixin, SafeCOSEKeyWrapper):
             private=self,
         )
 
+    def generate_sign1(self, payload, phdr=None, uhdr=None):
+        """
+        Generate a COSE Sign1 message using this private key.
+        """
+        # Construct the protected header
+        _phdr = {Algorithm: EdDSA}
+        if phdr is not None:
+            _phdr.update(phdr)
+
+        # Construct the message
+        msg = Sign1Message(phdr=_phdr, uhdr=uhdr, payload=payload)
+        msg.key = self.key
+
+        # Encode
+        return msg.encode()
+
 
 class SafeOKPPublicKey(PublicKeyMixin, SafeCOSEKeyWrapper):
     """
     A wrapped up COSE OKP public key.
     """
 
-    pass
+    def validate_sign1(self, msg):
+        """
+        Validate a COSE Sign1 message using this public key.
+        """
+        if not isinstance(msg, Sign1Message):
+            # Decode the bytes to an object
+            msg = CoseMessage.decode(msg)
+
+        # Assign the key
+        msg.key = self.key
+
+        # Validate
+        if msg.verify_signature():
+            return msg
+        else:
+            raise ValueError(
+                "Bad signature: Message %r does not match key %r"
+                % (msg, self)
+            )
 
 
 def import_cose_key(keydata):
