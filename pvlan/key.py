@@ -272,7 +272,7 @@ class CertifiedObject(object):
             )
 
         # cert.pubkey is the SafeOKPPublicKey that signed the cert
-        cert.pubkey.key.validate_sign1(self._certobject)
+        cert.pubkey.validate_sign1(self._certobject)
 
         # All checks out
         self._signed_pubkey = cert
