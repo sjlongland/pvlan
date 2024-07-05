@@ -58,6 +58,7 @@ class DecryptedEnc0Message(object):
     Wrapper object with CoseMessage-like interface for representing
     a ENC0 message that has been decrypted.
     """
+
     def __init__(self, enc0, payload):
         self._enc0 = enc0
         self._payload = payload
