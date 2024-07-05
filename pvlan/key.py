@@ -61,6 +61,7 @@ class KeyPurpose(enum.Enum):
       given node.
     - USERAUTH keys are public keys used to authenticate the message from a
       given user.
+    - TOKEN keys are public keys used to sign authorisation tokens.
     - CERTIFICATION keys are public keys used to authenticate all key types
     """
 
@@ -68,6 +69,7 @@ class KeyPurpose(enum.Enum):
     MULTICAST = 1
     NODEAUTH = 2
     USERAUTH = 3
+    TOKEN = 6
     CERTIFICATION = 7
 
 
