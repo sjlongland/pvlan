@@ -53,6 +53,28 @@ DEFAULT_CURVE = "ED25519"
 _SECRETS = weakref.WeakValueDictionary()
 
 
+class DecryptedEnc0Message(object):
+    """
+    Wrapper object with CoseMessage-like interface for representing
+    a ENC0 message that has been decrypted.
+    """
+    def __init__(self, enc0, payload):
+        self._enc0 = enc0
+        self._payload = payload
+
+    @property
+    def phdr(self):
+        return self._enc0.phdr
+
+    @property
+    def uhdr(self):
+        return self._enc0.uhdr
+
+    @property
+    def payload(self):
+        return self._payload
+
+
 class KeyPurpose(enum.Enum):
     """
     Enumeration for describing the purpose of a key.  There are several key
@@ -1179,7 +1201,7 @@ class SafeCOSESymmetricKey(SafeCOSEKeyWrapper):
             msg = CoseMessage.decode(msg)
 
         msg.key = self.key
-        return msg.decrypt()
+        return DecryptedEnc0Message(msg, msg.decrypt())
 
     def generate_mac0(
         self, payload, algorithm=HMAC256, phdr=None, uhdr=None, kid=None
