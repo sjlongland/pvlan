@@ -10,8 +10,10 @@ Key input/output, derivation and utility routines
 import weakref
 import hashlib
 import os
+import os.path
 import enum
 import uuid
+from collections.abc import Mapping, Set
 
 import cbor2
 
@@ -189,14 +191,10 @@ class KeyID(object):
         return hash((self.owner_uuid, self.purpose, self.fingerprint))
 
 
-class KeyCertificate(object):
+class CertifiedObject(object):
     """
-    A certificate representing a public key and its intended use case, signed
-    by a certification key.  Yes, poor man's X509.
-
-    The structure of the certificate is an array:
-    - Key purpose
-    - Public key data
+    A certified object is a data structure which has been signed by a
+    certificate authority.
     """
 
     @classmethod
@@ -205,95 +203,57 @@ class KeyCertificate(object):
             return cls.decode(f.read())
 
     @staticmethod
-    def decode(certbytes):
-        # Unpack the certificate
-        certificate = CoseMessage.decode(certbytes)
+    def _decode(objbytes):
+        # Unpack the certified object
+        certobject = CoseMessage.decode(objbytes)
 
         # Decode the payload
-        payload = cbor2.loads(certificate.payload)
+        payload = cbor2.loads(certobject.payload)
 
-        # Extract the purpose field
-        purpose = KeyPurpose(payload[0])
+        # Return them for downstream processing
+        return (certobject, payload)
 
-        if purpose == KeyPurpose.CERTIFICATION:
-            return CertificationKeyCertificate(
-                certbytes, certificate, payload
-            )
-        else:
-            return KeyCertificate(certbytes, certificate, purpose, payload)
-
-    def __init__(self, certbytes, certificate, purpose, payload):
-        # Store the certificate as-is; this is a COSE Sign1, we cannot
+    def __init__(self, certbytes, certobject):
+        # Store the certified object as-is; this is a COSE Sign1, we cannot
         # re-generate this without the private key!
         self._certbytes = certbytes
-        self._certificate = certificate
-        self._purpose = purpose
+        self._certobject = certobject
 
-        # Extract key pieces of the certificate
-        self._signed_kid = KeyID.decode(self._certificate.phdr[KID])
-        self._pubkey = import_cose_key(payload[1])
-
-        # The public key that certified this certificate
+        # Retrieve the key signing information
+        self._signed_kid = KeyID.decode(self._certobject.phdr[KID])
         self._signed_pubkey = None
-
-        # Sanity check
-        if self._purpose not in (
-            KeyPurpose.NODEAUTH,
-            KeyPurpose.USERAUTH,
-            KeyPurpose.CERTIFICATION,
-        ):
-            raise ValueError(
-                "Certificates may not be used for %s keys"
-                % self._purpose.label
-            )
-
-        if not isinstance(self._pubkey, SafeOKPPublicKey):
-            raise ValueError("Certified key is not an OKP key")
 
     def __repr__(self):
         """
-        Return a representation of the key certificate
+        Return a representation of the certified object
         """
-        return ("<%s key:%s purpose:%s signed:%s>") % (
+        return ("<%s signed:%s %r>") % (
             self.__class__.__name__,
-            self.pubkey,
-            self.purpose,
             self.signed_pubkey or self.signed_kid,
+            self._certobject,
         )
 
     @property
     def signed_kid(self):
         """
-        Return the key ID that signed this certificate.
+        Return the key ID that signed this object.
         """
         return self._signed_kid
 
     @property
     def signed_pubkey(self):
         """
-        Return the public key that certified this certificate.
+        Return the public key that certified this object.
         """
         return self._signed_pubkey
 
-    @property
-    def purpose(self):
-        """
-        Return the purpose of this key, one of node/user authentication or
-        key certification.
-        """
-        return self._purpose
-
-    @property
-    def pubkey(self):
-        """
-        Return the public key being certified.
-        """
-        return self._pubkey
-
-    def validate(self, cert):
+    def validate(self, cert, revoked_fps=None):
         """
         Validate against the given certification key certificate.  Throws a
         ``ValueError`` if certification fails.
+
+        revoked_fps is ignored in the base class, but is used to check
+        public key fingerprints against a revocation list in subclasses.
         """
         if self._signed_pubkey is cert:
             # We already did that
@@ -310,8 +270,8 @@ class KeyCertificate(object):
             )
 
         # cert.pubkey is the SafeOKPPublicKey that signed the cert
-        self._certificate.key = cert.pubkey.key
-        if self._certificate.verify_signature():
+        self._certobject.key = cert.pubkey.key
+        if self._certobject.verify_signature():
             # All checks out
             self._signed_pubkey = cert
         else:
@@ -322,6 +282,13 @@ class KeyCertificate(object):
         Validate the certificate, looking for all required keys in the given
         key store.  The key store is a dict keyed by KeyID.
         """
+        # If the certificate store gives us a revocation list, grab that too
+        try:
+            revoked_fps = keystore.revoked_fps
+        except AttributeError:
+            # Assume nothing revoked
+            revoked_fps = set()
+
         # Fetch the key that signed us
         cert = keystore[self.signed_kid]
 
@@ -350,21 +317,15 @@ class KeyCertificate(object):
         # Certify the root
         parent = order[0]
         assert parent.is_self_signed, "Discovered root is not self-signed!"
-        parent.validate(parent)
+        parent.validate(parent, revoked_fps)
 
         # Certify the rest of the chain
         for cert in order[1:]:
-            cert.validate(parent)
+            cert.validate(parent, revoked_fps)
             parent = cert
 
         # Return the validated certificate chain
         return order
-
-    def get_kid(self, owner_uuid):
-        """
-        Return the KID for this public key given the owner UUID.
-        """
-        return KeyID(owner_uuid, self.purpose, self.pubkey.fingerprint)
 
     def __bytes__(self):
         """
@@ -380,6 +341,126 @@ class KeyCertificate(object):
             f.write(bytes(self))
 
 
+class KeyCertificate(CertifiedObject):
+    """
+    A certificate representing a public key and its intended use case, signed
+    by a certification key.  Yes, poor man's X509.
+
+    The structure of the certificate is an array:
+    - Key purpose
+    - Public key data
+    """
+
+    @staticmethod
+    def decode(certbytes):
+        # Extract the certificate and payload
+        (certificate, payload) = CertifiedObject._decode(certbytes)
+
+        # Extract the purpose field
+        purpose = KeyPurpose(payload[0])
+
+        if purpose == KeyPurpose.CERTIFICATION:
+            return CertificationKeyCertificate(
+                certbytes, certificate, payload
+            )
+        else:
+            return KeyCertificate(certbytes, certificate, purpose, payload)
+
+    def __init__(self, certbytes, certificate, purpose, payload):
+        super().__init__(certbytes, certificate)
+        self._purpose = purpose
+
+        # Extract key pieces of the certificate
+        self._pubkey = import_cose_key(payload[1])
+
+        # Sanity check
+        if self._purpose not in (
+            KeyPurpose.NODEAUTH,
+            KeyPurpose.USERAUTH,
+            KeyPurpose.CERTIFICATION,
+        ):
+            raise ValueError(
+                "Certificates may not be used for %s keys"
+                % self._purpose.label
+            )
+
+        if not isinstance(self._pubkey, SafeOKPPublicKey):
+            raise ValueError("Certified key is not an OKP key")
+
+    def __repr__(self):
+        """
+        Return a representation of the key certificate
+        """
+        return ("<%s key:%s purpose:%s signed:%s>") % (
+            self.__class__.__name__,
+            self.pubkey,
+            self.purpose,
+            self.signed_pubkey or self.signed_kid,
+        )
+
+    @property
+    def purpose(self):
+        """
+        Return the purpose of this key, one of node/user authentication or
+        key certification.
+        """
+        return self._purpose
+
+    @property
+    def pubkey(self):
+        """
+        Return the public key being certified.
+        """
+        return self._pubkey
+
+    def get_kid(self, owner_uuid):
+        """
+        Return the KID for this public key given the owner UUID.
+        """
+        return KeyID(owner_uuid, self.purpose, self.pubkey.fingerprint)
+
+    def validate(self, cert, revoked_fps=None):
+        """
+        Validate against the given certification key certificate.  Throws a
+        ``ValueError`` if certification fails.
+        """
+        if (revoked_fps is not None) and (
+            self.pubkey.fingerprint in revoked_fps
+        ):
+            raise ValueError("Certificate fingerprint is revoked")
+
+        # Pass to superclass for digital signature verification
+        super().validate(cert)
+
+
+class RevocationCertificate(CertifiedObject, Set):
+    """
+    A revocation certificate is a list of keys that were revoked together
+    at a given time.  The keys are specified by key fingerprint.
+    """
+
+    FILE_EXTN = ".pvrev"
+
+    @classmethod
+    def decode(cls, certbytes):
+        # Extract the certificate and payload
+        (certificate, payload) = CertifiedObject._decode(certbytes)
+        return cls(certbytes, certificate, payload)
+
+    def __init__(self, certbytes, certificate, payload):
+        super().__init__(certbytes, certificate)
+        self._keyfps = set(payload)
+
+    def __contains__(self, keyid):
+        return keyid in self._keyfps
+
+    def __iter__(self):
+        return iter(self._keyfps)
+
+    def __len__(self):
+        return len(self._keyfps)
+
+
 class CertificationKeyCertificate(KeyCertificate):
     """
     A key certificate for certifying keys.  This has additional fields:
@@ -387,6 +468,8 @@ class CertificationKeyCertificate(KeyCertificate):
     - Authority UUID
     - Authority description
     """
+
+    FILE_EXTN = ".pvccrt"
 
     def __init__(self, certbytes, certificate, payload):
         super().__init__(
@@ -448,9 +531,9 @@ class CertificationKeyCertificate(KeyCertificate):
         return super().get_kid(owner_uuid)
 
 
-class CertificationKeypair(object):
+class Keypair(object):
     """
-    A class for storing a private/public certification key pair.
+    A class for storing a private/public key pair.
     """
 
     @classmethod
@@ -464,57 +547,6 @@ class CertificationKeypair(object):
         (certdata, privkeydata) = cbor2.loads(ckpbytes)
         cert = KeyCertificate.decode(certdata)
         privkey = import_cose_key(privkeydata)
-        return cls(cert, privkey)
-
-    @staticmethod
-    def _gen_cert(privkey, kid, purpose, pubkey, *args):
-        """
-        Generate a certificate with the given key ID and private key.
-        """
-        # Construct the certificate payload
-        payload = cbor2.dumps([purpose.value, bytes(pubkey)] + list(args))
-
-        # Construct the protected header
-        phdr = {Algorithm: EdDSA, KID: bytes(kid)}
-
-        # Construct the message
-        msg = Sign1Message(phdr=phdr, payload=payload)
-        msg.key = privkey.key
-
-        # Encode
-        encoded = msg.encode()
-
-        # Return the decoded certificate to sanity check
-        return KeyCertificate.decode(encoded)
-
-    @classmethod
-    def generate_root(cls, authority_desc, authority_uuid=None):
-        """
-        Generate a new root certificate authority key pair.
-        """
-        if authority_uuid is None:
-            authority_uuid = uuid.uuid4()
-
-        privkey = SafeOKPPrivateKey.generate()
-        pubkey = privkey.public
-        kid = KeyID(
-            authority_uuid, KeyPurpose.CERTIFICATION, pubkey.fingerprint
-        )
-
-        # Self-sign
-        cert = cls._gen_cert(
-            privkey,
-            kid,
-            KeyPurpose.CERTIFICATION,
-            pubkey,
-            authority_uuid.bytes,
-            authority_desc,
-        )
-
-        # Verify for sanity
-        cert.validate(cert)
-
-        # Return the validated certificate
         return cls(cert, privkey)
 
     def __init__(self, cert, privkey):
@@ -547,6 +579,77 @@ class CertificationKeypair(object):
         Write the public key certificate to a file.
         """
         self._cert.save_cert(path)
+
+
+class CertificationKeypair(Keypair):
+    """
+    A class for storing a private/public certification key pair.
+    """
+
+    FILE_EXTN = ".pvckpr"
+
+    @staticmethod
+    def _gen_obj(decoder, privkey, kid, payload):
+        """
+        Generate a certificate with the given key ID and private key.
+        """
+        # Construct the certificate payload
+        payload = cbor2.dumps(payload)
+
+        # Construct the protected header
+        phdr = {Algorithm: EdDSA, KID: bytes(kid)}
+
+        # Construct the message
+        msg = Sign1Message(phdr=phdr, payload=payload)
+        msg.key = privkey.key
+
+        # Encode
+        encoded = msg.encode()
+
+        # Return the decoded certificate to sanity check
+        return decoder(encoded)
+
+    @classmethod
+    def _gen_cert(cls, privkey, kid, purpose, pubkey, *args):
+        """
+        Generate a certificate with the given key ID and private key.
+        """
+        return cls._gen_obj(
+            KeyCertificate.decode,
+            privkey,
+            kid,
+            [purpose.value, bytes(pubkey)] + list(args),
+        )
+
+    @classmethod
+    def generate_root(cls, authority_desc, authority_uuid=None):
+        """
+        Generate a new root certificate authority key pair.
+        """
+        if authority_uuid is None:
+            authority_uuid = uuid.uuid4()
+
+        privkey = SafeOKPPrivateKey.generate()
+        pubkey = privkey.public
+        kid = KeyID(
+            authority_uuid, KeyPurpose.CERTIFICATION, pubkey.fingerprint
+        )
+
+        # Self-sign
+        cert = cls._gen_cert(
+            privkey,
+            kid,
+            KeyPurpose.CERTIFICATION,
+            pubkey,
+            authority_uuid.bytes,
+            authority_desc,
+        )
+
+        # Verify for sanity
+        cert.validate(cert)
+
+        # Return the validated certificate
+        return cls(cert, privkey)
 
     def generate_nodeauth(self, pubkey):
         """
@@ -599,6 +702,214 @@ class CertificationKeypair(object):
             privkey.public, authority_desc, authority_uuid
         )
         return self.__class__(cert, privkey)
+
+    def revoke_certs(self, *certs):
+        """
+        Revoke one or more certificates.
+        """
+
+        # Check they were in fact, issued by this CA first!
+        for cert in certs:
+            if cert.signed_pubkey is None:
+                # Try validating against this CA
+                cert.validate(self.cert)
+
+            if cert.signed_kid != self.cert.kid:
+                raise ValueError(
+                    "Certificate %r not signed by this CA" % cert
+                )
+
+        # Generate the signed certificate
+        revcert = self._gen_obj(
+            RevocationCertificate.decode,
+            self._privkey,
+            self._cert.kid,
+            [cert.pubkey.fingerprint for cert in certs],
+        )
+
+        # Verify for sanity
+        revcert.validate(self.cert)
+
+        # Return the validated certificate
+        return revcert
+
+
+class CertificateStore(Mapping):
+    """
+    A dict-like certificate store that automatically validates the
+    certificates loaded into it.
+    """
+
+    def __init__(self):
+        self._revoked_fps = set()
+        self._certs = {}
+        self._certs_fp = {}
+        self._certs_ca = {}
+
+    def __getitem__(self, keyid):
+        return self._certs[keyid]
+
+    def __iter__(self):
+        return iter(self._certs)
+
+    def __len__(self):
+        return len(self._certs)
+
+    @property
+    def revoked_fps(self):
+        """
+        Return all of the revoked fingerprints known to this certificate
+        store.
+        """
+        return self._revoked_fps.copy()
+
+    def get_cert_fp(self, fp):
+        """
+        Fetch a certificate by fingerprint.
+        """
+        return self._certs_fp[fp]
+
+    def add(self, *certs):
+        """
+        Add one or more certificates to the certificate store.  All
+        certificates are validated prior to inclusion.
+        """
+
+        # We have the following keys accessible to us just now
+        new_keys = dict((c.kid, c) for c in certs)
+
+        while new_keys:
+            certs = list(new_keys.values())
+            changed = False
+
+            for cert in certs:
+                if not isinstance(cert, CertificationKeyCertificate):
+                    raise TypeError(
+                        "All certificates must be for certifications only"
+                    )
+
+                if cert.pubkey.fingerprint in self._revoked_fps:
+                    # This key is revoked
+                    new_keys.pop(cert.kid, None)
+                    changed = True
+                    continue
+
+                # If the certificate is self-signed, validate it against
+                # itself.  Otherwise, just validate it against our
+                # existing validated certificates.
+                if cert.is_self_signed:
+                    cert.validate(cert)
+                else:
+                    # If the certificate depends on a new key, defer doing it
+                    # for now.
+                    if cert.signed_kid in new_keys:
+                        continue
+
+                    # Try validate this against the keys we know are valid
+                    cert.validate_chain(self._certs)
+
+                # If we're still here, it is valid, add it in, remove it
+                # from the to-do list
+                self._certs[cert.kid] = cert
+                self._certs_fp[cert.pubkey.fingerprint] = cert
+                self._certs_ca.setdefault(cert.signed_kid, []).append(cert)
+                new_keys.pop(cert.kid, None)
+                changed = True
+
+            # If none were changed, we have a problem
+            if not changed:
+                break
+
+        if new_keys:
+            # There are left-overs, force-validate one to raise an error
+            for cert in new_keys.values():
+                cert.validate_chain(self._certs)
+
+    def add_dir(
+        self,
+        path,
+        cert_extn=CertificationKeyCertificate.FILE_EXTN,
+        rev_extn=RevocationCertificate.FILE_EXTN,
+    ):
+        """
+        Add all the certificates in the given directory.
+        """
+        loaded_key_certs = []
+        loaded_rev_certs = []
+        for name in os.listdir(path):
+            (_, extn) = os.path.splitext(name)
+            fullname = os.path.join(path, name)
+
+            if extn == cert_extn:
+                loaded_key_certs.append(KeyCertificate.load(fullname))
+            elif extn == rev_extn:
+                loaded_rev_certs.append(RevocationCertificate.load(fullname))
+
+        self.add(*loaded_key_certs)
+        self.apply_revocations(*loaded_rev_certs)
+
+    def apply_revocations(self, *certs):
+        """
+        Apply the certificate revocations specified in the given revocation
+        lists.
+        """
+
+        def _revoke(cert, certlist):
+            fp = cert.pubkey.fingerprint
+            kid = cert.kid
+            self._revoked_fps.add(fp)
+            self._certs.pop(kid, None)
+            self._certs_fp.pop(fp, None)
+            certlist.append(cert)
+
+        revoked = []
+        for cert in certs:
+            # Firstly, validate it is valid
+            cert.validate_chain(self._certs)
+
+            # Iterate over all the fingerprints in the certificate
+            for fp in cert:
+                try:
+                    match = self.get_cert_fp(fp)
+                except KeyError:
+                    # We don't have this one
+                    continue
+
+                # Was this certificate signed by the same CA?
+                if match.signed_kid != cert.signed_kid:
+                    # Nope!  So ignore it.
+                    continue
+
+                # Extra careful check
+                if (
+                    match.signed_pubkey.fingerprint
+                    != cert.signed_pubkey.fingerprint
+                ):
+                    continue
+
+                # Okay, good enough, rip it out.
+                _revoke(match, revoked)
+
+        # Check for any child certificates that are invalidated by this.
+        while True:
+            extra_revoked = []
+            for cert in revoked:
+                try:
+                    child_certs = self._certs_ca[cert.kid]
+                except KeyError:
+                    continue
+
+                # Revoke these too
+                for ccert in child_certs:
+                    _revoke(ccert, extra_revoked)
+
+            if extra_revoked:
+                revoked += extra_revoked
+            else:
+                # We're done
+                break
+
+        return revoked
 
 
 class SafeSecret(object):
