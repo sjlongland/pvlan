@@ -59,7 +59,7 @@ class SixLowHAMAgent(object):
 
         # Cast inputs
         if if_mac is not None:
-            if_mac = MAC.parse(mac, reserve=True)
+            if_mac = MAC.parse(if_mac, reserve=True)
 
         # Interface settings.  Make a note of which ones were supplied
         # to us by the caller in case the agent gets stopped and re-started.
