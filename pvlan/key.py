@@ -1461,6 +1461,7 @@ def keymgr_main():
     """
     Key manager: a CLI tool for generating and managing keys.
     """
+
     def _rev_list(log, args):
         revcrt = RevocationCertificate.load(args.rev_cert)
         for fp in revcrt:
