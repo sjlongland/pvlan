@@ -7,6 +7,8 @@ Key input/output, derivation and utility routines
 # © 2024 Stuart Longland
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
+import logging
+import argparse
 import weakref
 import hashlib
 import os
@@ -561,9 +563,16 @@ class Keypair(object):
         )
 
     @property
+    def privkey(self):
+        """
+        Return the private key for this key pair
+        """
+        return self._privkey
+
+    @property
     def cert(self):
         """
-        Return the public key for this CA
+        Return the public key for this key pair
         """
         return self._cert
 
@@ -644,9 +653,20 @@ class CertificationKeypair(Keypair):
         # Return the validated certificate
         return cls(cert, privkey)
 
-    def generate_nodeauth(self, pubkey):
+    def generate_node_keypair(self):
         """
-        Sign and generate a certificate for this public key.
+        Sign and generate a node keypair
+        """
+        # Generate the private key
+        privkey = SafeOKPPrivateKey.generate()
+        cert = self.generate_node(privkey.public)
+
+        # Wrap the two up in a keypair
+        return Keypair(cert, privkey)
+
+    def generate_node(self, pubkey):
+        """
+        Sign and generate a certificate for this node public key.
         """
         # Generate the signed certificate
         cert = self._gen_cert(
@@ -1435,3 +1455,335 @@ class SafeX25519PublicKey(PublicKeyMixin, SafeSecret):
 
     def __bytes__(self):
         return self.key.public_bytes_raw()
+
+
+def keymgr_main():
+    """
+    Key manager: a CLI tool for generating and managing keys.
+    """
+    def _rev_list(log, args):
+        revcrt = RevocationCertificate.load(args.rev_cert)
+        for fp in revcrt:
+            print(fp.hex(":", 2))
+
+    def _key_generate(log, args):
+        log.info("Creating a private key in %s", args.privkey)
+        if os.path.exists(args.privkey):
+            log.warning("Existing private key will be overwritten!")
+
+        key = SafeOKPPrivateKey.generate()
+        key.save_key(args.privkey)
+
+    def _key_getpub(log, args):
+        log.info("Retrieving the public key in %s", args.privkey)
+        if os.path.exists(args.pubkey):
+            log.warning("Existing public key will be overwritten!")
+
+        key = load_cose_key(args.privkey)
+        key.public.save_key(args.pubkey)
+
+    def _kp_assemble(log, args):
+        log.info("Assembling a keypair %s", args.keypair)
+        if os.path.exists(args.keypair):
+            log.warning("Existing key pair will be overwritten!")
+
+        cert = KeyCertificate.load(args.cert)
+        key = load_cose_key(args.privkey)
+        kp = Keypair(cert, key)
+        kp.save_keypair(args.keypair)
+
+    def _kp_getpriv(log, args):
+        log.info("Retrieving the private key in %s", args.keypair)
+        if os.path.exists(args.privkey):
+            log.warning("Existing private key will be overwritten!")
+
+        kp = Keypair.load(args.keypair)
+        kp.privkey.save_key(args.privkey)
+
+    def _kp_getcert(log, args):
+        log.info("Retrieving the certificate in %s", args.keypair)
+        if os.path.exists(args.cert):
+            log.warning("Existing certificate will be overwritten!")
+
+        kp = Keypair.load(args.keypair)
+        kp.cert.save_cert(args.cert)
+
+    def _kp_info(log, args):
+        kp = Keypair.load(args.keypair)
+        print("Purpose: %s" % kp.cert.purpose.name)
+        print("FP: %s" % kp.cert.pubkey.fingerprint.hex(":", 2))
+
+    def _ca_info(log, args):
+        kp = CertificationKeypair.load(args.keypair)
+        print("Description: %s" % kp.cert.authority_desc)
+        print("UUID: %s" % kp.cert.authority_uuid)
+        print("KID: %s" % kp.cert.kid)
+        print("FP: %s" % kp.cert.pubkey.fingerprint.hex(":", 2))
+
+    def _ca_gen_root(log, args):
+        log.info(
+            "Creating a new CA (%r) in %s", args.description, args.keypair
+        )
+        if os.path.exists(args.keypair):
+            log.warning("Existing keypair will be overwritten!")
+
+        uuid = uuid.UUID(args.uuid) if args.uuid else None
+
+        kp = CertificationKeypair.generate_root(
+            authority_desc=args.description, authority_uuid=uuid
+        )
+        kp.save_keypair(args.keypair)
+
+    def _ca_generate_child(log, args):
+        log.info(
+            "Creating a child CA (%r) in %s of the CA in %s",
+            args.description,
+            args.child_keypair,
+            args.keypair,
+        )
+        if os.path.exists(args.child_keypair):
+            log.warning("Existing keypair will be overwritten!")
+
+        uuid = uuid.UUID(args.uuid) if args.uuid else None
+
+        pkp = CertificationKeypair.load(args.keypair)
+        ckp = pkp.generate_certification_keypair(
+            authority_desc=args.description, authority_uuid=uuid
+        )
+        ckp.save_keypair(args.child_keypair)
+
+    def _ca_sign_child(log, args):
+        log.info(
+            "Signing a child CA (%r) in %s of the CA in %s",
+            args.description,
+            args.child_cert,
+            args.keypair,
+        )
+        if os.path.exists(args.child_cert):
+            log.warning("Existing certificate will be overwritten!")
+
+        uuid = uuid.UUID(args.uuid) if args.uuid else None
+
+        pubkey = load_cose_key(args.child_pubkey)
+
+        pkp = CertificationKeypair.load(args.keypair)
+        crt = pkp.generate_certification(
+            pubkey=pubkey,
+            authority_desc=args.description,
+            authority_uuid=uuid,
+        )
+        crt.save_cert(args.child_cert)
+
+    def _ca_generate_node(log, args):
+        log.info(
+            "Creating a node keypair in %s of the CA in %s",
+            args.node_keypair,
+            args.keypair,
+        )
+        if os.path.exists(args.node_keypair):
+            log.warning("Existing keypair will be overwritten!")
+
+        pkp = CertificationKeypair.load(args.keypair)
+        ckp = pkp.generate_node_keypair()
+        ckp.save_keypair(args.node_keypair)
+
+    def _ca_sign_node(log, args):
+        log.info(
+            "Signing a node certificate in %s of the CA in %s",
+            args.node_cert,
+            args.keypair,
+        )
+        if os.path.exists(args.node_cert):
+            log.warning("Existing certificate will be overwritten!")
+
+        uuid = uuid.UUID(args.uuid) if args.uuid else None
+
+        pubkey = load_cose_key(args.node_pubkey)
+
+        pkp = CertificationKeypair.load(args.keypair)
+        crt = pkp.generate_node(pubkey=pubkey)
+        crt.save_cert(args.node_cert)
+
+    def _ca_revoke(log, args):
+        log.info(
+            "Revoking keys signed by the CA %s",
+            args.keypair,
+        )
+        if os.path.exists(args.rev_cert):
+            log.warning(
+                "Existing revocation certificate will be overwritten!"
+            )
+
+        pkp = CertificationKeypair.load(args.keypair)
+
+        certs = []
+        for certpath in args.certs:
+            log.debug("Reading certificate in %s", certpath)
+            try:
+                cert = KeyCertificate.load(certpath)
+            except AttributeError:
+                # Did we get given a keypair instead?
+                kp = Keypair.load(certpath)
+                cert = kp.cert
+
+            cert.validate(pkp.cert)
+
+            log.info("Will revoke ID %s", cert.pubkey.fingerprint.hex(":", 2))
+            certs.append(cert)
+
+        revcrt = pkp.revoke_certs(*certs)
+        revcrt.save_cert(args.rev_cert)
+        log.info("Written to %s", args.rev_cert)
+
+    ap = argparse.ArgumentParser(
+        description="Manage PVLAN cryptographic keys"
+    )
+    ap.add_argument(
+        "--log-level",
+        help="Logging level",
+        type=str,
+        default="info",
+        choices=("debug", "info", "warning", "error", "fatal"),
+    )
+    ap_sub = ap.add_subparsers(help="sub-command help", required=True)
+
+    ap_rev_list = ap_sub.add_parser(
+        "rev_list", help="List the contents of a revocation certificate"
+    )
+    ap_rev_list.set_defaults(fn=_rev_list, logger="pvlan.rev_list")
+    ap_rev_list.add_argument("rev_cert", help="Revocation certificate file")
+
+    ap_key = ap_sub.add_parser(
+        "key", help="Perform operations on bare private keys"
+    )
+    ap_key_sub = ap_key.add_subparsers(required=True)
+
+    ap_key_gen = ap_key_sub.add_parser(
+        "generate", help="Generate a private key"
+    )
+    ap_key_gen.set_defaults(fn=_key_generate, logger="pvlan.key.gen")
+    ap_key_gen.add_argument("privkey", help="Path to private key")
+
+    ap_key_getpub = ap_key_sub.add_parser(
+        "getpub", help="Extract a public key"
+    )
+    ap_key_getpub.set_defaults(fn=_key_getpub, logger="pvlan.key.getpub")
+    ap_key_getpub.add_argument("privkey", help="Path to private key")
+    ap_key_getpub.add_argument("pubkey", help="Path to public key")
+
+    ap_kp = ap_sub.add_parser("kp", help="Perform operations on keypairs")
+    ap_kp.add_argument("keypair", help="Path to keypair")
+
+    ap_kp_sub = ap_kp.add_subparsers(required=True)
+
+    ap_kp_assemble = ap_kp_sub.add_parser(
+        "assemble",
+        help="Assemble a keypair from a certificate and a private key",
+    )
+    ap_kp_assemble.set_defaults(fn=_kp_assemble, logger="pvlan.kp.assemble")
+    ap_kp_assemble.add_argument("cert", help="Path to signed certificate")
+    ap_kp_assemble.add_argument("privkey", help="Path to private key")
+
+    ap_kp_getpriv = ap_kp_sub.add_parser(
+        "getpriv", help="Extract a private key"
+    )
+    ap_kp_getpriv.set_defaults(fn=_kp_getpriv, logger="pvlan.kp.getpriv")
+    ap_kp_getpriv.add_argument("privkey", help="Path to private key")
+
+    ap_kp_getcert = ap_kp_sub.add_parser(
+        "getcert", help="Extract a public key"
+    )
+    ap_kp_getcert.set_defaults(fn=_kp_getcert, logger="pvlan.kp.getcert")
+    ap_kp_getcert.add_argument("cert", help="Path to certificate")
+
+    ap_kp_getfp = ap_kp_sub.add_parser("info", help="Dump keypair info")
+    ap_kp_getfp.set_defaults(fn=_kp_info, logger="pvlan.kp.info")
+
+    ap_ca = ap_sub.add_parser("ca", help="Perform operations as a CA")
+    ap_ca.add_argument("keypair", help="Keypair file storing the CA keys")
+
+    ap_ca_sub = ap_ca.add_subparsers(required=True)
+
+    ap_ca_info = ap_ca_sub.add_parser("info", help="Dump CA information")
+    ap_ca_info.set_defaults(fn=_ca_info, logger="pvlan.key.ca.info")
+
+    ap_ca_gen_root = ap_ca_sub.add_parser(
+        "gen_root", help="Generate a new CA"
+    )
+    ap_ca_gen_root.set_defaults(
+        fn=_ca_gen_root, logger="pvlan.key.ca.gen.root"
+    )
+    ap_ca_gen_root.add_argument("description", help="CA description")
+    ap_ca_gen_root.add_argument("uuid", help="CA UUID", nargs="?")
+
+    ap_ca_generate_child = ap_ca_sub.add_parser(
+        "gen_child", help="Generate a child CA"
+    )
+    ap_ca_generate_child.set_defaults(
+        fn=_ca_generate_child, logger="pvlan.key.ca.gen.child"
+    )
+    ap_ca_generate_child.add_argument(
+        "child_keypair", help="Path to the child keypair"
+    )
+    ap_ca_generate_child.add_argument("description", help="CA description")
+    ap_ca_generate_child.add_argument("uuid", help="CA UUID", nargs="?")
+
+    ap_ca_sign_child = ap_ca_sub.add_parser(
+        "sign_child", help="Generate a child CA from existing public key"
+    )
+    ap_ca_sign_child.set_defaults(
+        fn=_ca_sign_child, logger="pvlan.key.ca.sign.child"
+    )
+    ap_ca_sign_child.add_argument(
+        "child_pubkey", help="Path to the child public key"
+    )
+    ap_ca_sign_child.add_argument(
+        "child_cert", help="Path to the child certificate to generate"
+    )
+    ap_ca_sign_child.add_argument("description", help="CA description")
+    ap_ca_sign_child.add_argument("uuid", help="CA UUID", nargs="?")
+
+    ap_ca_generate_node = ap_ca_sub.add_parser(
+        "gen_node", help="Generate a node keypair"
+    )
+    ap_ca_generate_node.set_defaults(
+        fn=_ca_generate_node, logger="pvlan.key.ca.gen.node"
+    )
+    ap_ca_generate_node.add_argument(
+        "node_keypair", help="Path to the node keypair"
+    )
+
+    ap_ca_sign_node = ap_ca_sub.add_parser(
+        "sign_node",
+        help="Generate a node certificate from existing public key",
+    )
+    ap_ca_sign_node.set_defaults(
+        fn=_ca_sign_node, logger="pvlan.key.ca.sign.node"
+    )
+    ap_ca_sign_node.add_argument(
+        "node_pubkey", help="Path to the node public key"
+    )
+    ap_ca_sign_node.add_argument(
+        "node_cert", help="Path to the node certificate to generate"
+    )
+
+    ap_ca_revoke = ap_ca_sub.add_parser(
+        "revoke",
+        help="Generate a revocation certificate for the given certificates",
+    )
+    ap_ca_revoke.set_defaults(fn=_ca_revoke, logger="pvlan.key.ca.revoke")
+    ap_ca_revoke.add_argument(
+        "rev_cert", help="Path to the revocation certificate"
+    )
+    ap_ca_revoke.add_argument(
+        "certs", help="Path to the certificates to revoke", nargs="+"
+    )
+
+    args = ap.parse_args()
+    logging.basicConfig(level=args.log_level.upper())
+
+    args.fn(logging.getLogger(args.logger), args)
+
+
+if __name__ == "__main__":
+    keymgr_main()
