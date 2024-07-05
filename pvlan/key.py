@@ -17,12 +17,14 @@ from collections.abc import Mapping, Set
 
 import cbor2
 
-from pycose.algorithms import EdDSA
-from pycose.headers import Algorithm, KID
+from pycose.algorithms import EdDSA, HMAC256, A256GCM
+from pycose.headers import Algorithm, KID, IV
 from pycose.keys import OKPKey, CoseKey, keytype
 from pycose.keys.keyparam import KpKty, SymKpK, KpKeyOps
 from pycose.messages import (
     Sign1Message,
+    Enc0Message,
+    Mac0Message,
     CoseMessage,
 )
 
@@ -1109,6 +1111,74 @@ class SafeCOSESymmetricKey(SafeCOSEKeyWrapper):
                 }
             )
         )
+
+    def generate_enc0(
+        self,
+        payload,
+        algorithm=A256GCM,
+        iv=None,
+        iv_sz=16,
+        phdr=None,
+        uhdr=None,
+    ):
+        """
+        Generate a ENC0 message encrypted using this symmetric key.
+        """
+        # TODO: figure out iv_sz from the algorithm somehow.
+
+        # Generate an IV if we do not have one yet
+        iv = SafeRandomSecret.cast_or_generate(iv, iv_sz)
+
+        # Construct the protected header
+        _phdr = {Algorithm: algorithm, IV: bytes(iv)}
+        if phdr is not None:
+            _phdr.update(phdr)
+
+        # Construct the message
+        msg = Enc0Message(phdr=_phdr, uhdr=uhdr, payload=payload)
+        msg.key = self.key
+        return msg.encode()
+
+    def decrypt_enc0(self, msg):
+        """
+        Decrypt a ENC0 message encrypted using this symmetric key.
+        """
+        if not isinstance(msg, Enc0Message):
+            # Decode the bytes to an object
+            msg = CoseMessage.decode(msg)
+
+        msg.key = self.key
+        return msg.decrypt()
+
+    def generate_mac0(self, payload, algorithm=HMAC256, phdr=None, uhdr=None):
+        """
+        Generate a MAC0 message keyed using this symmetric key.
+        """
+        # Construct the protected header
+        _phdr = {Algorithm: algorithm}
+        if phdr is not None:
+            _phdr.update(phdr)
+
+        # Construct the message
+        msg = Mac0Message(phdr=_phdr, uhdr=uhdr, payload=payload)
+        msg.key = self.key
+        return msg.encode()
+
+    def validate_mac0(self, msg):
+        """
+        Validate a MAC0 message keyed using this symmetric key.
+        """
+        if not isinstance(msg, Mac0Message):
+            # Decode the bytes to an object
+            msg = CoseMessage.decode(msg)
+
+        msg.key = self.key
+        if msg.verify_tag():
+            return msg
+        else:
+            raise ValueError(
+                "MAC0 message %r tag does not match key %r" % (msg, self)
+            )
 
 
 class SafeOKPPrivateKey(PrivateKeyMixin, SafeCOSEKeyWrapper):
