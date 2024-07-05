@@ -10,9 +10,19 @@ Key input/output, derivation and utility routines
 import weakref
 import hashlib
 import os
+import enum
+import uuid
 
+import cbor2
+
+from pycose.algorithms import EdDSA
+from pycose.headers import Algorithm, KID
 from pycose.keys import OKPKey, CoseKey, keytype
 from pycose.keys.keyparam import KpKty, SymKpK, KpKeyOps
+from pycose.messages import (
+    Sign1Message,
+    CoseMessage,
+)
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
@@ -35,6 +45,540 @@ DEFAULT_CURVE = "ED25519"
 # References to every secret by identity.  So we can ensure the same ident
 # never references two different secrets!
 _SECRETS = weakref.WeakValueDictionary()
+
+
+class KeyPurpose(enum.Enum):
+    """
+    Enumeration for describing the purpose of a key.  There are several key
+    types for different occasions:
+
+    - UNICAST keys are for one-to-one communications between two nodes and
+      are used for all messages passed directly between those nodes.
+    - MULTICAST keys are used for a node to encrypt messages it sends by
+      multicast.  All other nodes will need a copy of this to decrypt the
+      communications.
+    - NODEAUTH keys are public keys used to authenticate the message from a
+      given node.
+    - USERAUTH keys are public keys used to authenticate the message from a
+      given user.
+    - CERTIFICATION keys are public keys used to authenticate all key types
+    """
+
+    UNICAST = 0
+    MULTICAST = 1
+    NODEAUTH = 2
+    USERAUTH = 3
+    CERTIFICATION = 7
+
+
+class KeyID(object):
+    """
+    Representation of a key ID.
+    """
+
+    NODE_ID_POS = 0
+    NODE_ID_LEN = 16
+    PURPOSE_LEN = 1
+    PURPOSE_POS = 16
+    FINGERPRINT_POS = 17
+    FINGERPRINT_LEN = 3
+
+    KID_LEN = NODE_ID_LEN + PURPOSE_LEN + FINGERPRINT_LEN
+
+    @classmethod
+    def decode(cls, kidbytes):
+        """
+        Decode a key ID from the byte string
+        """
+        if len(kidbytes) != cls.KID_LEN:
+            raise ValueError("Improper KID length")
+
+        owner_uuid = uuid.UUID(
+            bytes=kidbytes[
+                cls.NODE_ID_POS : cls.NODE_ID_POS + cls.NODE_ID_LEN
+            ]
+        )
+        purpose = KeyPurpose(kidbytes[cls.PURPOSE_POS])
+        fingerprint = kidbytes[-cls.FINGERPRINT_LEN :]
+
+        return cls(owner_uuid, purpose, fingerprint)
+
+    def __init__(self, owner_uuid, purpose, fingerprint):
+        self._owner_uuid = owner_uuid
+        self._purpose = purpose
+        self._fingerprint = bytes(fingerprint)[0 : self.FINGERPRINT_LEN]
+
+    @property
+    def owner_uuid(self):
+        """
+        Return the owner UUID
+        """
+        return self._owner_uuid
+
+    @property
+    def purpose(self):
+        """
+        Return the key purpose
+        """
+        return self._purpose
+
+    @property
+    def fingerprint(self):
+        """
+        Return the (truncated) key fingerprint.
+        """
+        return self._fingerprint
+
+    def __eq__(self, other):
+        """
+        Determine if the key ID is equivalent to another key ID.
+        """
+        return (
+            (self.owner_uuid == other.owner_uuid)
+            and (self.purpose == other.purpose)
+            and (self.fingerprint == other.fingerprint)
+        )
+
+    def __bytes__(self):
+        """
+        Encode the key ID as bytes for the KID header.
+        """
+        return (
+            self.owner_uuid.bytes
+            + bytes([self.purpose.value])
+            + self.fingerprint
+        )
+
+    def __repr__(self):
+        """
+        Return a representation of the key ID
+        """
+        return (
+            "%s(owner_uuid=%r, purpose=%s, fingerprint=bytes.fromhex(%r))"
+        ) % (
+            self.__class__.__name__,
+            self.owner_uuid,
+            self.purpose,
+            self.fingerprint.hex(),
+        )
+
+    def __hash__(self):
+        """
+        Generate a hash of this key ID for indexing purposes.
+        """
+        return hash((self.owner_uuid, self.purpose, self.fingerprint))
+
+
+class KeyCertificate(object):
+    """
+    A certificate representing a public key and its intended use case, signed
+    by a certification key.  Yes, poor man's X509.
+
+    The structure of the certificate is an array:
+    - Key purpose
+    - Public key data
+    """
+
+    @classmethod
+    def load(cls, path):
+        with open(path, "rb") as f:
+            return cls.decode(f.read())
+
+    @staticmethod
+    def decode(certbytes):
+        # Unpack the certificate
+        certificate = CoseMessage.decode(certbytes)
+
+        # Decode the payload
+        payload = cbor2.loads(certificate.payload)
+
+        # Extract the purpose field
+        purpose = KeyPurpose(payload[0])
+
+        if purpose == KeyPurpose.CERTIFICATION:
+            return CertificationKeyCertificate(
+                certbytes, certificate, payload
+            )
+        else:
+            return KeyCertificate(certbytes, certificate, purpose, payload)
+
+    def __init__(self, certbytes, certificate, purpose, payload):
+        # Store the certificate as-is; this is a COSE Sign1, we cannot
+        # re-generate this without the private key!
+        self._certbytes = certbytes
+        self._certificate = certificate
+        self._purpose = purpose
+
+        # Extract key pieces of the certificate
+        self._signed_kid = KeyID.decode(self._certificate.phdr[KID])
+        self._pubkey = import_cose_key(payload[1])
+
+        # The public key that certified this certificate
+        self._signed_pubkey = None
+
+        # Sanity check
+        if self._purpose not in (
+            KeyPurpose.NODEAUTH,
+            KeyPurpose.USERAUTH,
+            KeyPurpose.CERTIFICATION,
+        ):
+            raise ValueError(
+                "Certificates may not be used for %s keys"
+                % self._purpose.label
+            )
+
+        if not isinstance(self._pubkey, SafeOKPPublicKey):
+            raise ValueError("Certified key is not an OKP key")
+
+    def __repr__(self):
+        """
+        Return a representation of the key certificate
+        """
+        return ("<%s key:%s purpose:%s signed:%s>") % (
+            self.__class__.__name__,
+            self.pubkey,
+            self.purpose,
+            self.signed_pubkey or self.signed_kid,
+        )
+
+    @property
+    def signed_kid(self):
+        """
+        Return the key ID that signed this certificate.
+        """
+        return self._signed_kid
+
+    @property
+    def signed_pubkey(self):
+        """
+        Return the public key that certified this certificate.
+        """
+        return self._signed_pubkey
+
+    @property
+    def purpose(self):
+        """
+        Return the purpose of this key, one of node/user authentication or
+        key certification.
+        """
+        return self._purpose
+
+    @property
+    def pubkey(self):
+        """
+        Return the public key being certified.
+        """
+        return self._pubkey
+
+    def validate(self, cert):
+        """
+        Validate against the given certification key certificate.  Throws a
+        ``ValueError`` if certification fails.
+        """
+        if self._signed_pubkey is cert:
+            # We already did that
+            return
+
+        elif self._signed_pubkey is not None:
+            raise ValueError(
+                "Key already certified with %r" % self._signed_pubkey
+            )
+
+        if not isinstance(cert, CertificationKeyCertificate):
+            raise TypeError(
+                "Given certificate is not a certificatation key certificate"
+            )
+
+        # cert.pubkey is the SafeOKPPublicKey that signed the cert
+        self._certificate.key = cert.pubkey.key
+        if self._certificate.verify_signature():
+            # All checks out
+            self._signed_pubkey = cert
+        else:
+            raise ValueError("Bad signature in %r" % self)
+
+    def validate_chain(self, keystore):
+        """
+        Validate the certificate, looking for all required keys in the given
+        key store.  The key store is a dict keyed by KeyID.
+        """
+        # Fetch the key that signed us
+        cert = keystore[self.signed_kid]
+
+        # Put these in the chain in order
+        order = [self, cert]
+
+        # Make a note of previously seen fingerprints
+        seen = set([self.pubkey.fingerprint, cert.pubkey.fingerprint])
+
+        while not cert.is_self_signed:
+            # Move to its signing key
+            cert = keystore[cert.signed_kid]
+
+            # Check for loops
+            fp = cert.pubkey.fingerprint
+            if fp in seen:
+                raise ValueError("Loop detected!")
+            seen.add(fp)
+
+            # Add it to the chain
+            order.append(cert)
+
+        # If we get here without KeyErrors, we have the whole chain.
+        order.reverse()
+
+        # Certify the root
+        parent = order[0]
+        assert parent.is_self_signed, "Discovered root is not self-signed!"
+        parent.validate(parent)
+
+        # Certify the rest of the chain
+        for cert in order[1:]:
+            cert.validate(parent)
+            parent = cert
+
+        # Return the validated certificate chain
+        return order
+
+    def get_kid(self, owner_uuid):
+        """
+        Return the KID for this public key given the owner UUID.
+        """
+        return KeyID(owner_uuid, self.purpose, self.pubkey.fingerprint)
+
+    def __bytes__(self):
+        """
+        Return the certificate in encoded form.
+        """
+        return self._certbytes
+
+    def save_cert(self, path):
+        """
+        Write the certificate to a file.
+        """
+        with open(path, "wb") as f:
+            f.write(bytes(self))
+
+
+class CertificationKeyCertificate(KeyCertificate):
+    """
+    A key certificate for certifying keys.  This has additional fields:
+
+    - Authority UUID
+    - Authority description
+    """
+
+    def __init__(self, certbytes, certificate, payload):
+        super().__init__(
+            certbytes, certificate, KeyPurpose.CERTIFICATION, payload
+        )
+
+        self._authority_uuid = uuid.UUID(bytes=payload[2])
+        self._authority_desc = payload[3]
+
+        if not isinstance(self._authority_desc, str):
+            raise ValueError("Description must be a text string")
+
+    def __repr__(self):
+        """
+        Return a representation of the key certificate
+        """
+        return ("<%s %r uuid:%s key:%s signed:%s>") % (
+            self.__class__.__name__,
+            self.authority_desc,
+            self.authority_uuid,
+            self.pubkey,
+            (
+                "self"
+                if self.is_self_signed
+                else (self.signed_pubkey or self.signed_kid)
+            ),
+        )
+
+    @property
+    def is_self_signed(self):
+        """
+        Return true if this is a self-signed certificate.  (Root key)
+        """
+        return self.signed_kid == self.kid
+
+    @property
+    def kid(self):
+        """
+        Return this key's ID
+        """
+        return self.get_kid(self.authority_uuid)
+
+    @property
+    def authority_uuid(self):
+        return self._authority_uuid
+
+    @property
+    def authority_desc(self):
+        return self._authority_desc
+
+    def get_kid(self, owner_uuid):
+        """
+        Return the KID for this public key.
+        """
+        if owner_uuid != self.authority_uuid:
+            raise ValueError(
+                "Certification keys must use the UUID of the authority"
+            )
+        return super().get_kid(owner_uuid)
+
+
+class CertificationKeypair(object):
+    """
+    A class for storing a private/public certification key pair.
+    """
+
+    @classmethod
+    def load(cls, path):
+        with open(path, "rb") as f:
+            return cls.decode(f.read())
+
+    @classmethod
+    def decode(cls, ckpbytes):
+        # Unpack the certificate key pair
+        (certdata, privkeydata) = cbor2.loads(ckpbytes)
+        cert = KeyCertificate.decode(certdata)
+        privkey = import_cose_key(privkeydata)
+        return cls(cert, privkey)
+
+    @staticmethod
+    def _gen_cert(privkey, kid, purpose, pubkey, *args):
+        """
+        Generate a certificate with the given key ID and private key.
+        """
+        # Construct the certificate payload
+        payload = cbor2.dumps([purpose.value, bytes(pubkey)] + list(args))
+
+        # Construct the protected header
+        phdr = {Algorithm: EdDSA, KID: bytes(kid)}
+
+        # Construct the message
+        msg = Sign1Message(phdr=phdr, payload=payload)
+        msg.key = privkey.key
+
+        # Encode
+        encoded = msg.encode()
+
+        # Return the decoded certificate to sanity check
+        return KeyCertificate.decode(encoded)
+
+    @classmethod
+    def generate_root(cls, authority_desc, authority_uuid=None):
+        """
+        Generate a new root certificate authority key pair.
+        """
+        if authority_uuid is None:
+            authority_uuid = uuid.uuid4()
+
+        privkey = SafeOKPPrivateKey.generate()
+        pubkey = privkey.public
+        kid = KeyID(
+            authority_uuid, KeyPurpose.CERTIFICATION, pubkey.fingerprint
+        )
+
+        # Self-sign
+        cert = cls._gen_cert(
+            privkey,
+            kid,
+            KeyPurpose.CERTIFICATION,
+            pubkey,
+            authority_uuid.bytes,
+            authority_desc,
+        )
+
+        # Verify for sanity
+        cert.validate(cert)
+
+        # Return the validated certificate
+        return cls(cert, privkey)
+
+    def __init__(self, cert, privkey):
+        self._cert = cert
+        self._privkey = privkey
+
+    def __repr__(self):
+        return "%s(%r, %r)" % (
+            self.__class__.__name__,
+            self._cert,
+            self._privkey,
+        )
+
+    @property
+    def cert(self):
+        """
+        Return the public key for this CA
+        """
+        return self._cert
+
+    def save_keypair(self, path):
+        """
+        Write the key pair to a file.
+        """
+        with open(path, "wb") as f:
+            f.write(cbor2.dumps([bytes(self._cert), bytes(self._privkey)]))
+
+    def save_cert(self, path):
+        """
+        Write the public key certificate to a file.
+        """
+        self._cert.save_cert(path)
+
+    def generate_nodeauth(self, pubkey):
+        """
+        Sign and generate a certificate for this public key.
+        """
+        # Generate the signed certificate
+        cert = self._gen_cert(
+            self._privkey, self._cert.kid, KeyPurpose.NODEAUTH, pubkey
+        )
+
+        # Verify for sanity
+        cert.validate(self.cert)
+
+        # Return the validated certificate
+        return cert
+
+    def generate_certification(
+        self, pubkey, authority_desc, authority_uuid=None
+    ):
+        """
+        Sign and generate a child certificate authority with the given key.
+        """
+        if authority_uuid is None:
+            authority_uuid = uuid.uuid4()
+
+        # Generate the signed certificate
+        cert = self._gen_cert(
+            self._privkey,
+            self._cert.kid,
+            KeyPurpose.CERTIFICATION,
+            pubkey,
+            authority_uuid.bytes,
+            authority_desc,
+        )
+
+        # Verify for sanity
+        cert.validate(self.cert)
+
+        # Return the validated certificate
+        return cert
+
+    def generate_certification_keypair(
+        self, authority_desc, authority_uuid=None
+    ):
+        """
+        Generate a child CA.
+        """
+        privkey = SafeOKPPrivateKey.generate()
+        cert = self.generate_certification(
+            privkey.public, authority_desc, authority_uuid
+        )
+        return self.__class__(cert, privkey)
 
 
 class SafeSecret(object):
