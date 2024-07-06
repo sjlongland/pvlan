@@ -10,7 +10,8 @@ PVLAN messaging
 import uuid
 import time
 import enum
-from collections.abc import Mapping, Sequence
+from collections import namedtuple
+from collections.abc import Mapping, Sequence, Set
 
 from pycose.headers import KID
 from pycose.messages import (
@@ -30,6 +31,8 @@ from .key import (
     SafeX25519PublicKey,
     import_cose_key,
 )
+from .mac import MAC
+from .frame import VLANEthernetPayload
 
 
 # Symmetric key lifetime
@@ -41,6 +44,36 @@ ENC0_SZ_OVERHEAD = 66
 
 # Approximate SIGN1 overhead, measured at ~99 bytes
 SIGN1_SZ_OVERHEAD = 99
+
+
+class MACSubscription(
+    namedtuple("MACSubscriptionBase", ["lifetime", "cost"])
+):
+    """
+    Representation of MAC subscription parameters.
+    """
+
+    MIN_LIFETIME = 0
+    MAX_LIFETIME = 3600
+
+    MIN_COST = 0
+    MAX_COST = 65535
+
+    def __init__(self, lifetime, cost=0):
+        # Sanitise and clamp inputs
+        if not isinstance(lifetime, int):
+            raise TypeError("lifetime must be an integer")
+        else:
+            lifetime = min(
+                self.MAX_LIFETIME, max(lifetime, self.MIN_LIFETIME)
+            )
+
+        if not isinstance(cost, int):
+            raise TypeError("cost must be an integer")
+        else:
+            cost = min(self.MAX_COST, max(cost, self.MIN_COST))
+
+        super().__init__(lifetime, cost)
 
 
 class EthernetFrameFragment(object):
@@ -238,6 +271,9 @@ class NodeMsgType(enum.Enum):
 
     KEYS = "SK"  # Sender key solicitation
     KEYN = "sk"  # Sender key notification
+
+    MLS = "ML"  # MAC Listener solicitation
+    MLN = "ml"  # MAC Listener notification
 
     ETN = "et"  # Ethernet traffic notification
     RRN = "rr"  # Request Refusal notification
@@ -1006,3 +1042,122 @@ class NodeMsgSenderKeyNotification(NodeMsgBase, Mapping):
                 keys.append(key.as_cbor_array)
 
         return [unrecognised_kids] + keys
+
+
+@NodeMsgBase.register
+class NodeMsgMACListenerSolicitation(NodeMsgBase, Set):
+    """
+    MAC Listener solicitation, a request for whomever is listening for
+    one of the listed MAC addresses.
+
+    The payload is:
+    - first element: VLAN ID, or None for untagged
+    - remainder: raw IEEE 802.3 (EUI-48) MAC addresses.
+
+    The message is a COSE Enc0 message wrapped in a COSE Sign1.
+    """
+
+    MSG_TYPE = NodeMsgType.MLS
+
+    @classmethod
+    def _decode(cls, outermsg, innermsg, rq_id, payload):
+        vlan = payload[0]
+        maclist = [MAC.parse(macbytes) for macbytes in payload[1:]]
+
+        return cls(maclist, rq_id=rq_id, vlan=vlan)
+
+    def __init__(self, rq_id, maclist, vlan=None):
+        super().__init__(rq_id)
+
+        if vlan is not None:
+            # Only pass the VLAN ID itself
+            vlan &= VLANEthernetPayload.VLAN_MASK
+
+        self._maclist = maclist
+        self._vlan = vlan
+
+    @property
+    def vlan(self):
+        return self._vlan
+
+    def __contains__(self, mac):
+        return mac in self._maclist
+
+    def __len__(self):
+        return len(self._maclist)
+
+    def __iter__(self):
+        return iter(self._maclist)
+
+    def _get_payload(self):
+        return [bytes(mac) for mac in self]
+
+
+@NodeMsgBase.register
+class NodeMsgMACListenerNotification(NodeMsgBase, Mapping):
+    """
+    MAC Listener notification, a statement of what MAC addresses this node is
+    listening for.
+
+    The payload is:
+
+    - first element: VLAN ID, or None for untagged
+    - subsequent elements: CBOR representation of MACSubscription (array)
+      with the raw IEEE 802.3 EUI-48 (byte string) prepended.
+      (i.e. [ MAC, LIFETIME, COST ]; 14 bytes each as CBOR)
+
+    The message is a COSE Enc0 message wrapped in a COSE Sign1.
+    """
+
+    MSG_TYPE = NodeMsgType.MLN
+
+    @staticmethod
+    def _cast_subscription(sub):
+        if isinstance(sub, int):
+            return MACSubscription(sub)  # Default path cost
+        elif isinstance(sub, dict):
+            return MACSubscription(**sub)
+        else:
+            return MACSubscription(*sub)
+
+    @classmethod
+    def _decode(cls, outermsg, innermsg, rq_id, payload):
+        return cls(
+            rq_id=rq_id,
+            maclifetimes=dict(
+                (MAC.frombytes(sub[0]), MACSubscription(*sub[1:]))
+                for sub in payload[1:]
+            ),
+            vlan=payload[0],
+        )
+
+    def __init__(self, rq_id, subscriptions, vlan=None):
+        super().__init__(rq_id)
+
+        if vlan is not None:
+            # Only pass the VLAN ID itself
+            vlan &= VLANEthernetPayload.VLAN_MASK
+
+        self._vlan = vlan
+        self._subscriptions = dict(
+            (MAC.parse(mac), self._cast_subscription(sub))
+            for mac, sub in subscriptions.items()
+        )
+
+    @property
+    def vlan(self):
+        return self._vlan
+
+    def __getitem__(self, mac):
+        return self._subscriptions[mac]
+
+    def __iter__(self):
+        return iter(self._subscriptions)
+
+    def __len__(self):
+        return len(self._subscriptions)
+
+    def _get_payload(self):
+        return [self.vlan] + [
+            [bytes(mac)] + list(sub) for mac, sub in self.items()
+        ]
