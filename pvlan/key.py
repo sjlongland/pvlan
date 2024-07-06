@@ -753,20 +753,26 @@ class CertificateStore(Mapping):
     certificates loaded into it.
     """
 
-    def __init__(self):
+    def __init__(self, parent=None):
+        self._parent = parent
         self._revoked_fps = set()
         self._certs = {}
         self._certs_fp = {}
         self._certs_ca = {}
 
     def __getitem__(self, keyid):
-        return self._certs[keyid]
+        try:
+            return self._certs[keyid]
+        except KeyError:
+            if self._parent is None:
+                raise
+            return self._parent[keyid]
 
     def __iter__(self):
-        return iter(self._certs)
+        return iter(self._keyset)
 
     def __len__(self):
-        return len(self._certs)
+        return len(self._keyset)
 
     @property
     def revoked_fps(self):
@@ -774,13 +780,24 @@ class CertificateStore(Mapping):
         Return all of the revoked fingerprints known to this certificate
         store.
         """
-        return self._revoked_fps.copy()
+        if self._parent:
+            revoked = self._parent.revoked_fps
+            revoked.update(self._revoked_fps)
+        else:
+            revoked = self._revoked_fps.copy()
+
+        return revoked
 
     def get_cert_fp(self, fp):
         """
         Fetch a certificate by fingerprint.
         """
-        return self._certs_fp[fp]
+        try:
+            return self._certs_fp[fp]
+        except KeyError:
+            if self._parent is None:
+                raise
+            return self._parent.get_cert_fp(fp)
 
     def add(self, *certs):
         """
@@ -923,6 +940,13 @@ class CertificateStore(Mapping):
                 break
 
         return revoked
+
+    @property
+    def _keyset(self):
+        keys = set(self._certs.keys())
+        if self._parent:
+            keys |= set(self._parent.keys())
+        return keys
 
 
 class SafeSecret(object):
