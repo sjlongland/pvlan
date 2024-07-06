@@ -1551,10 +1551,10 @@ def keymgr_main():
         if os.path.exists(args.keypair):
             log.warning("Existing keypair will be overwritten!")
 
-        uuid = uuid.UUID(args.uuid) if args.uuid else None
+        authority_uuid = uuid.UUID(args.uuid) if args.uuid else None
 
         kp = CertificationKeypair.generate_root(
-            authority_desc=args.description, authority_uuid=uuid
+            authority_desc=args.description, authority_uuid=authority_uuid
         )
         kp.save_keypair(args.keypair)
 
@@ -1568,11 +1568,11 @@ def keymgr_main():
         if os.path.exists(args.child_keypair):
             log.warning("Existing keypair will be overwritten!")
 
-        uuid = uuid.UUID(args.uuid) if args.uuid else None
+        authority_uuid = uuid.UUID(args.uuid) if args.uuid else None
 
         pkp = CertificationKeypair.load(args.keypair)
         ckp = pkp.generate_certification_keypair(
-            authority_desc=args.description, authority_uuid=uuid
+            authority_desc=args.description, authority_uuid=authority_uuid
         )
         ckp.save_keypair(args.child_keypair)
 
@@ -1586,7 +1586,7 @@ def keymgr_main():
         if os.path.exists(args.child_cert):
             log.warning("Existing certificate will be overwritten!")
 
-        uuid = uuid.UUID(args.uuid) if args.uuid else None
+        authority_uuid = uuid.UUID(args.uuid) if args.uuid else None
 
         pubkey = load_cose_key(args.child_pubkey)
 
@@ -1594,7 +1594,7 @@ def keymgr_main():
         crt = pkp.generate_certification(
             pubkey=pubkey,
             authority_desc=args.description,
-            authority_uuid=uuid,
+            authority_uuid=authority_uuid,
         )
         crt.save_cert(args.child_cert)
 
@@ -1619,8 +1619,6 @@ def keymgr_main():
         )
         if os.path.exists(args.node_cert):
             log.warning("Existing certificate will be overwritten!")
-
-        uuid = uuid.UUID(args.uuid) if args.uuid else None
 
         pubkey = load_cose_key(args.node_pubkey)
 
