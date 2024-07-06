@@ -985,6 +985,12 @@ class SafeSecret(object):
         with open(path, "wb") as f:
             f.write(bytes(self))
 
+    def __len__(self):
+        """
+        Return the length of the raw key in bytes.
+        """
+        return len(bytes(self))
+
     def __bytes__(self):
         """
         Return the key in its raw form.
