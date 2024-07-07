@@ -7,6 +7,7 @@ PVLAN operations
 # © 2024 Stuart Longland
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
+import asyncio
 import uuid
 
 from pycose.keys.keyops import MacCreateOp, MacVerifyOp, EncryptOp, DecryptOp
@@ -24,6 +25,8 @@ from .msg import (
     NodeMsgPeerKeyVerificationNotification,
     NodeMsgSenderKeySolicitation,
     NodeMsgSenderKeyNotification,
+    NodeMsgMACListenerSolicitation,
+    NodeMsgMACListenerNotification,
     NodeRequestRefusalNotification,
 )
 
@@ -70,6 +73,9 @@ class NodeOpBase(object):
         # Start the timer
         self._log.debug("Time-out timer started")
         self._timeout = self._loop.call_later(OP_TIMEOUT, self._on_timeout)
+
+        # Fire off asynchronous tasks
+        asyncio.create_task(self._asyncstart())
 
     def _on_recv(self, addr, kid, outermsg, msg):
         """
@@ -130,29 +136,53 @@ class NodeOpBase(object):
             self._future.set_result(result)
 
 
-class NodeFetchIdentityOp(NodeOpBase):
+class NodeOneShotOp(NodeOpBase):
     """
-    Asynchronously fetch the identity of a node.
+    Asynchronously request something from a node.
     """
 
-    def __init__(self, ownnode, targetnode, future):
+    ENCRYPTED = True
+
+    def __init__(self, ownnode, targetnode, future, **kwargs):
         super().__init__(self, ownnode, targetnode, future)
+        self._kwargs = kwargs
 
-    def start(self):
-        super().start()
-        # Request the identity
-        self._ownnode._send_msg(
-            NodeMsgIDSolicitation(
-                rq_id=self.rq_id,
-                name=self._ownnode.name,
-                kid=self._ownnode.node_kid,
-                cert=self._ownnode.node_cert,
-                usertoken=self._ownnode.usertoken,
-                ca_keyids=self._ownnode.ca_keyids,
-            ),
-            self._targetnode._last_address,
-            symkey=None,
-        )
+    @property
+    def _encrypt(self):
+        return self.ENCRYPTED
+
+    @property
+    def _rq_msg(self):
+        return self.REQUEST_MSG_CLASS(rq_id=self.rq_id, **self._kwargs)
+
+    async def _asyncstart(self):
+        try:
+            symkey = self._targetnode.o2o_key
+            if self._encrypt and (symkey is None):
+                self._log.info(
+                    "Operation requires shared one-to-one key, requesting "
+                    "negotiation"
+                )
+                symkey = await self._targetnode._negotiate_o2o_key()
+
+            # Submit the request
+            msg = _rq_msg
+            self._log.debug(
+                "Sending %s request %s",
+                msg.__class__.__name__,
+                (
+                    ("encrypted with key %s" % symkey.kid)
+                    if symkey
+                    else "unencrypted"
+                ),
+            )
+            self._ownnode._send_msg(
+                msg, self._targetnode._last_address, symkey=symkey
+            )
+        except Exception as ex:
+            # Catch exceptions
+            self._log.exception("Failed one-shot operation")
+            self._on_failure(ex)
 
     def _on_recv(self, addr, kid, outermsg, msg):
         super()._on_recv(addr, kid, outermsg, msg)
@@ -161,9 +191,7 @@ class NodeFetchIdentityOp(NodeOpBase):
             if isinstance(msg, NodeRequestRefusalNotification):
                 raise msg.as_exc()
 
-            if isinstance(msg, NodeMsgIDNotification):
-                self._finish(msg)
-            else:
+            if not self._check_response(addr, kid, outermsg, msg):
                 self._ownnode._send_msg(
                     NodeRequestRefusalNotification.from_exc(
                         TypeError(
@@ -176,17 +204,201 @@ class NodeFetchIdentityOp(NodeOpBase):
                 )
         except Exception as ex:
             # Catch exceptions
-            self._log.exception("Failed to request identity")
+            self._log.exception("One-shot operation fails")
             self._on_failure(ex)
 
+    def _check_response(self, addr, kid, outermsg, msg):
+        """
+        Check if this is the sort of message we expected.
+        """
+        return isinstance(msg, self.EXPECTED_MSG_CLASS)
 
-class NodeFetchCACertsOp(NodeOpBase):
+    def _process_response(self, addr, kid, outermsg, msg):
+        """
+        Process the resultant message.
+        """
+        self._finish(msg)
+
+
+class NodeMultiShotOp(NodeOpBase):
     """
-    Asynchronously fetch the given CA certificates.
+    Asynchronously fetch something from a node that requires multiple requests
     """
 
     # How long we wait before sending the next batch?
     FOLLOWUP_DELAY = 5.0
+
+    # By default, require encrypted comms
+    ENCRYPTED = True
+
+    def __init__(self, ownnode, targetnode, future, **kwargs):
+        super().__init__(self, ownnode, targetnode, future)
+        self._kwargs = kwargs
+        self._followup_timeout = None
+
+    @property
+    def _encrypt(self):
+        return self.ENCRYPTED
+
+    @property
+    def _rq_msg(self):
+        return self.REQUEST_MSG_CLASS(rq_id=self.rq_id, **self._kwargs)
+
+    async def _asyncstart(self):
+        await _send_next()
+
+    async def _send_next(self, addr=None):
+        try:
+            self._cancel_followup()
+
+            # Perform checks to see what is needed
+            await self._check_if_done()
+
+            # If we're done, finish up
+            if self._is_done:
+                # Nothing more to do
+                self._finish()
+                return
+
+            symkey = self._targetnode.o2o_key
+            if self._encrypt and (symkey is None):
+                self._log.info(
+                    "Operation requires shared one-to-one key, requesting "
+                    "negotiation"
+                )
+                symkey = await self._targetnode._negotiate_o2o_key()
+
+            # Submit the next part of the request
+            msg = _rq_msg
+            self._log.debug(
+                "Sending %s request %s",
+                msg.__class__.__name__,
+                (
+                    ("encrypted with key %s" % symkey.kid)
+                    if symkey
+                    else "unencrypted"
+                ),
+            )
+            self._ownnode._send_msg(
+                msg, addr or self._targetnode._last_address, symkey=symkey
+            )
+        except Exception as ex:
+            # Catch exceptions
+            self._log.exception("Failed one-shot operation")
+            self._on_failure(ex)
+
+    def _on_recv(self, addr, kid, outermsg, msg):
+        super()._on_recv(addr, kid, outermsg, msg)
+
+        try:
+            # Stop the follow-up timer
+            self._cancel_followup()
+
+            if isinstance(msg, NodeRequestRefusalNotification):
+                raise msg.as_exc()
+
+            asyncio.create_task(self._asyncrecv(addr, kid, outermsg, msg))
+        except Exception as ex:
+            # Catch exceptions
+            self._log.exception("Failed to process CA certificates")
+            self._on_failure(ex)
+
+    async def _asyncrecv(self, addr, kid, outermsg, msg):
+        try:
+            expected_type = await self._check_response(addr, kid, outermsg, msg)
+            if not expected_type:
+                self._ownnode._send_msg(
+                    NodeRequestRefusalNotification.from_exc(
+                        TypeError(
+                            "Unexpected message type: %s"
+                            % msg.__class__.__name__
+                        )
+                    ),
+                    addr,
+                    symkey=None,
+                )
+            try:
+                await self._process_response(addr, kid, outermsg, msg)
+
+                await self._check_if_done()
+                if self._is_done:
+                    self._log.info("Operation complete")
+                    self._finish()
+                else:
+                    self._log.info("More to come")
+                    self._schedule_followup()
+            except Exception as ex:
+                # Notify the sender
+                self._ownnode._send_msg(
+                    NodeRequestRefusalNotification.from_exc(ex),
+                    addr,
+                    symkey=None,
+                )
+                raise
+        except Exception as ex:
+            # Catch exceptions
+            self._log.exception("Failed to process CA certificates")
+            self._on_failure(ex)
+
+    async def _check_response(self, addr, kid, outermsg, msg):
+        """
+        Check if this is the sort of message we expected.
+        """
+        return isinstance(msg, self.EXPECTED_MSG_CLASS)
+
+    def _schedule_followup(self):
+        self._followup_timeout = self._loop.send_later(
+            self.FOLLOWUP_DELAY, self._on_followup
+        )
+
+    def _cancel_followup(self):
+        if self._followup_timeout is None:
+            self._followup_timeout.cancel()
+            self._followup_timeout = None
+
+    def _on_followup(self):
+        self._log.info("Sending follow-up request")
+        self._followup_timeout = None
+        self._send_next()
+
+    def _cleanup(self):
+        self._cancel_followup()
+        super()._cleanup()
+
+
+class NodeFetchIdentityOp(NodeOneShotOp):
+    """
+    Asynchronously fetch the identity of a node.
+    """
+
+    REQUEST_MSG_CLASS = NodeMsgIDSolicitation
+    EXPECTED_MSG_CLASS = NodeMsgIDNotification
+    ENCRYPT = False
+
+    def __init__(self, ownnode, targetnode, future, **kwargs):
+        super().__init__(
+            self,
+            ownnode,
+            targetnode,
+            future,
+            name=self._ownnode.name,
+            kid=self._ownnode.node_kid,
+            cert=self._ownnode.node_cert,
+            usertoken=self._ownnode.usertoken,
+            ca_keyids=self._ownnode.ca_keyids,
+        )
+
+
+class NodeFetchCACertsOp(NodeMultiShotOp):
+    """
+    Asynchronously fetch the given CA certificates.
+    """
+
+    # Don't require encryption
+    ENCRYPTED = False
+
+    REQUEST_MSG_CLASS = NodeMsgCASolicitation
+    EXPECTED_MSG_CLASS = NodeMsgCANotification
 
     def __init__(self, ca_kids, ownnode, targetnode, future):
         super().__init__(self, ownnode, targetnode, future)
@@ -194,11 +406,10 @@ class NodeFetchCACertsOp(NodeOpBase):
         self._todo = self._ca_kids.copy()
         self._unavailable_cas = set()
         self._candidate_cas = targetnode._candidate_cas
-        self._followup_timeout = None
 
-    def start(self):
-        super().start()
-        self._send_next()
+    @property
+    def _rq_msg(self):
+        return self.REQUEST_MSG_CLASS(keylist=self._todo, rq_id=self.rq_id)
 
     def _finish(self):
         """
@@ -221,118 +432,52 @@ class NodeFetchCACertsOp(NodeOpBase):
                 )
             )
 
-    def _send_next(self):
-        """
-        Choose and send a request for the next batch of CA certs.
-        """
-        try:
-            self._cancel_followup()
+    async def _check_if_done(self):
+        # Remove from the list any CAs that have been retrieved elsewhere
+        self._todo -= set(self._candidate_cas.keys())
 
-            # Remove from the list any CAs that have been retrieved elsewhere
-            self._todo -= set(self._candidate_cas.keys())
+    @property
+    def _is_done(self):
+        return not self._todo
 
-            # If we're done, finish up
-            if not self._todo:
-                # Nothing more to do
-                self._finish()
-                return
-
-            # Request the next bundle
-            self._ownnode._send_msg(
-                NodeMsgCASolicitation(keylist=self._todo, rq_id=self.rq_id),
-                self._targetnode._last_address,
-                symkey=None,
-            )
-
-            # Wait for a response
-            self._schedule_followup()
-        except Exception as ex:
-            # Catch exceptions
-            self._log.exception("Failed to request CA certificates")
-            self._on_failure(ex)
-
-    def _on_recv(self, addr, kid, outermsg, msg):
-        super()._on_recv(addr, kid, outermsg, msg)
-
-        try:
-            # Stop the follow-up timer
-            self._cancel_followup()
-
-            if isinstance(msg, NodeRequestRefusalNotification):
-                raise msg.as_exc()
-
-            try:
-                if not isinstance(msg, NodeMsgCANotification):
-                    raise TypeError(
-                        "Unexpected message type: %s" % msg.__class__.__name__
-                    )
-
-                for kid, cert in msg.items():
-                    self._log.debug("Received %s: %s", kid, cert)
-                    if cert is not None:
-                        self._candidate_cas[kid] = cert
-                    else:
-                        self._unavailable_cas.add(kid)
-                    self._todo.discard(kid)
-
-                # Are we done?
-                if self._todo:
-                    # Wait for more
-                    self._log.debug("Waiting for %d", len(self._todo))
-                    self._schedule_followup()
-                else:
-                    self._finish()
-            except Exception as ex:
-                # Notify the sender
-                self._ownnode._send_msg(
-                    NodeRequestRefusalNotification.from_exc(ex),
-                    addr,
-                    symkey=None,
-                )
-                raise
-        except Exception as ex:
-            # Catch exceptions
-            self._log.exception("Failed to process CA certificates")
-            self._on_failure(ex)
-
-    def _schedule_followup(self):
-        self._followup_timeout = self._loop.send_later(
-            self.FOLLOWUP_TIMEOUT, self._on_followup
-        )
-
-    def _cancel_followup(self):
-        if self._followup_timeout is None:
-            self._followup_timeout.cancel()
-            self._followup_timeout = None
-
-    def _on_followup(self):
-        self._followup_timeout = None
-        self._send_next()
-
-    def _cleanup(self):
-        self._cancel_followup()
-        super()._cleanup()
+    async def _process_response(self, addr, kid, outermsg, msg):
+        for kid, cert in msg.items():
+            self._log.debug("Received %s: %s", kid, cert)
+            if cert is not None:
+                self._candidate_cas[kid] = cert
+            else:
+                self._unavailable_cas.add(kid)
+            self._todo.discard(kid)
 
 
-class NodeFetchSenderKeyOp(NodeOpBase):
+class NodeFetchSenderKeysOp(NodeMultiShotOp):
     """
     Asynchronously fetch sender keys.
     """
 
-    # How long we wait before sending the next batch?
-    FOLLOWUP_DELAY = 5.0
+    REQUEST_MSG_CLASS = NodeMsgSenderKeySolicitation
+    EXPECTED_MSG_CLASS = NodeMsgSenderKeyNotification
 
     def __init__(self, sender_kids, ownnode, targetnode, future):
         super().__init__(self, ownnode, targetnode, future)
         self._sender_kids = set(sender_kids)
         self._todo = self._sender_kids.copy()
         self._unavailable_kids = set()
-        self._followup_timeout = None
         self._fetched = {}
 
-    def start(self):
-        super().start()
-        self._send_next()
+    @property
+    def _rq_msg(self):
+        return self.REQUEST_MSG_CLASS(
+            keylist=self._todo, rq_id=self.rq_id
+        )
+
+    async def _check_if_done(self):
+        # Remove from the list any keys that have been retrieved
+        self._todo -= set(self._fetched.keys())
+
+    @property
+    def _is_done(self):
+        return not self._todo
 
     def _finish(self):
         """
@@ -340,7 +485,7 @@ class NodeFetchSenderKeyOp(NodeOpBase):
         """
         self._log.info("No more keys left to fetch")
         if self._unavailable_kids:
-            # CAs were unavailable
+            # keys were unavailable
             self._on_failure(
                 ValueError(
                     "Sender keys could not be fetched: %s"
@@ -351,96 +496,14 @@ class NodeFetchSenderKeyOp(NodeOpBase):
             # Got 'em all.
             super()._finish(self._fetched)
 
-    def _send_next(self):
-        """
-        Choose and send a request for the next batch of CA certs.
-        """
-        try:
-            self._cancel_followup()
-
-            # If we're done, finish up
-            if not self._todo:
-                # Nothing more to do
-                self._finish()
-                return
-
-            # Request the next bundle
-            self._ownnode._send_msg(
-                NodeMsgSenderKeySolicitation(
-                    keylist=self._todo, rq_id=self.rq_id
-                ),
-                self._targetnode._last_address,
-                symkey=None,
-            )
-
-            # Wait for a response
-            self._schedule_followup()
-        except Exception as ex:
-            # Catch exceptions
-            self._log.exception("Failed to request CA certificates")
-            self._on_failure(ex)
-
-    def _on_recv(self, addr, kid, outermsg, msg):
-        super()._on_recv(addr, kid, outermsg, msg)
-
-        try:
-            # Stop the follow-up timer
-            self._cancel_followup()
-
-            if isinstance(msg, NodeRequestRefusalNotification):
-                raise msg.as_exc()
-
-            try:
-                if not isinstance(msg, NodeMsgSenderKeyNotification):
-                    raise TypeError(
-                        "Unexpected message type: %s" % msg.__class__.__name__
-                    )
-
-                for kid, cert in msg.items():
-                    self._log.debug("Received %s: %s", kid, cert)
-                    if cert is not None:
-                        self._candidate_cas[kid] = cert
-                    else:
-                        self._unavailable_kids.add(kid)
-                    self._todo.discard(kid)
-
-                # Are we done?
-                if self._todo:
-                    # Wait for more
-                    self._log.debug("Waiting for %d", len(self._todo))
-                    self._schedule_followup()
-                else:
-                    self._finish()
-            except Exception as ex:
-                # Notify the sender
-                self._ownnode._send_msg(
-                    NodeRequestRefusalNotification.from_exc(ex),
-                    addr,
-                    symkey=None,
-                )
-                raise
-        except Exception as ex:
-            # Catch exceptions
-            self._log.exception("Failed to process CA certificates")
-            self._on_failure(ex)
-
-    def _schedule_followup(self):
-        self._followup_timeout = self._loop.send_later(
-            self.FOLLOWUP_TIMEOUT, self._on_followup
-        )
-
-    def _cancel_followup(self):
-        if self._followup_timeout is None:
-            self._followup_timeout.cancel()
-            self._followup_timeout = None
-
-    def _on_followup(self):
-        self._followup_timeout = None
-        self._send_next()
-
-    def _cleanup(self):
-        self._cancel_followup()
-        super()._cleanup()
+    async def _process_response(self, addr, kid, outermsg, msg):
+        for kid, cert in msg.items():
+            self._log.debug("Received %s: %s", kid, cert)
+            if cert is not None:
+                self._candidate_cas[kid] = cert
+            else:
+                self._unavailable_kids.add(kid)
+            self._todo.discard(kid)
 
 
 class NodeInitiateSharedKeyOp(NodeOpBase):
@@ -723,3 +786,16 @@ class NodeRespondSharedKeyOp(NodeOpBase):
             # Catch exceptions and clean up request
             self._log.exception("Failed to perform ECDHE")
             self._on_failure(ex)
+
+
+class NodeFetchSubscriptionsOp(NodeOneShotOp):
+    """
+    Asynchronously fetch the MAC listener subscriptions of a node.
+    """
+
+    REQUEST_MSG_CLASS = NodeMsgMACListenerSolicitation
+    EXPECTED_MSG_CLASS = NodeMsgMACListenerNotification
+
+    def __init__(self, maclist, ownnode, targetnode, future, vlan=None):
+        super().__init__(self, ownnode, targetnode, future,
+                         maclist=maclist, vlan=vlan)
