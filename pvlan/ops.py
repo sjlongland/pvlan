@@ -167,7 +167,7 @@ class NodeOneShotOp(NodeOpBase):
                 symkey = await self._targetnode._negotiate_o2o_key()
 
             # Submit the request
-            msg = _rq_msg
+            msg = self._rq_msg
             self._log.debug(
                 "Sending %s request %s",
                 msg.__class__.__name__,
@@ -246,7 +246,7 @@ class NodeMultiShotOp(NodeOpBase):
         return self.REQUEST_MSG_CLASS(rq_id=self.rq_id, **self._kwargs)
 
     async def _asyncstart(self):
-        await _send_next()
+        await self._send_next()
 
     async def _send_next(self, addr=None):
         try:
@@ -270,7 +270,7 @@ class NodeMultiShotOp(NodeOpBase):
                 symkey = await self._targetnode._negotiate_o2o_key()
 
             # Submit the next part of the request
-            msg = _rq_msg
+            msg = self._rq_msg
             self._log.debug(
                 "Sending %s request %s",
                 msg.__class__.__name__,
