@@ -141,6 +141,7 @@ class NodeOneShotOp(NodeOpBase):
     Asynchronously request something from a node.
     """
 
+    # By default, these should be encrypted
     ENCRYPTED = True
 
     def __init__(self, ownnode, targetnode, future, **kwargs):
@@ -305,7 +306,9 @@ class NodeMultiShotOp(NodeOpBase):
 
     async def _asyncrecv(self, addr, kid, outermsg, msg):
         try:
-            expected_type = await self._check_response(addr, kid, outermsg, msg)
+            expected_type = await self._check_response(
+                addr, kid, outermsg, msg
+            )
             if not expected_type:
                 self._ownnode._send_msg(
                     NodeRequestRefusalNotification.from_exc(
@@ -373,7 +376,7 @@ class NodeFetchIdentityOp(NodeOneShotOp):
 
     REQUEST_MSG_CLASS = NodeMsgIDSolicitation
     EXPECTED_MSG_CLASS = NodeMsgIDNotification
-    ENCRYPT = False
+    ENCRYPTED = False
 
     def __init__(self, ownnode, targetnode, future, **kwargs):
         super().__init__(
@@ -455,6 +458,9 @@ class NodeFetchSenderKeysOp(NodeMultiShotOp):
     Asynchronously fetch sender keys.
     """
 
+    # Require this be encrypted!!!
+    ENCRYPTED = True
+
     REQUEST_MSG_CLASS = NodeMsgSenderKeySolicitation
     EXPECTED_MSG_CLASS = NodeMsgSenderKeyNotification
 
@@ -467,9 +473,7 @@ class NodeFetchSenderKeysOp(NodeMultiShotOp):
 
     @property
     def _rq_msg(self):
-        return self.REQUEST_MSG_CLASS(
-            keylist=self._todo, rq_id=self.rq_id
-        )
+        return self.REQUEST_MSG_CLASS(keylist=self._todo, rq_id=self.rq_id)
 
     async def _check_if_done(self):
         # Remove from the list any keys that have been retrieved
@@ -797,5 +801,6 @@ class NodeFetchSubscriptionsOp(NodeOneShotOp):
     EXPECTED_MSG_CLASS = NodeMsgMACListenerNotification
 
     def __init__(self, maclist, ownnode, targetnode, future, vlan=None):
-        super().__init__(self, ownnode, targetnode, future,
-                         maclist=maclist, vlan=vlan)
+        super().__init__(
+            self, ownnode, targetnode, future, maclist=maclist, vlan=vlan
+        )
