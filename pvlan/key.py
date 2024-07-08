@@ -71,12 +71,14 @@ class KeyPurpose(enum.Enum):
     - CERTIFICATION keys are public keys used to authenticate all key types
     """
 
-    UNICAST = 0
-    MULTICAST = 1
-    NODEAUTH = 2
-    USERAUTH = 3
-    TOKEN = 6
-    CERTIFICATION = 7
+    UNICAST = 0b00000000
+    UNICAST_DATA = 0b10000000
+    MULTICAST = 0b000000001
+    MULTICAST_DATA = 0b100000001
+    NODEAUTH = 0b00000010
+    USERAUTH = 0b00000011
+    TOKEN = 0b00000110
+    CERTIFICATION = 0b00000111
 
 
 class KeyID(object):
