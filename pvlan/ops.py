@@ -378,7 +378,7 @@ class NodeFetchIdentityOp(NodeOneShotOp):
     EXPECTED_MSG_CLASS = NodeMsgIDNotification
     ENCRYPTED = False
 
-    def __init__(self, ownnode, targetnode, future, **kwargs):
+    def __init__(self, ownnode, targetnode, future):
         super().__init__(
             self,
             ownnode,
