@@ -367,6 +367,471 @@ class NodeMsgType(enum.Enum):
     RRN = "rr"  # Request Refusal notification
 
 
+class NodeMsgState(enum.ENUM):
+    """
+    State of the given message.  The message can be in one of the following
+    states:
+
+    Incoming messages:
+    - UNDECODED: We have raw payload bytes, we have not tried to decode any of
+      it.
+    - OUTER_DECODED: We have decoded the outer message, but not verified or
+      decrypted it.
+    - INNER_DECODED: We have decoded the inner message, but decrypted it.
+    - DECODED: We have decoded the message in full.
+
+    Outgoing messages:
+    - UNENCODED: We just have the bare original message.
+    - CBOR_ENCODED: We have encoded the CBOR payload.
+    - ENCRYPTED: We have encrypted the innermost message (or it wasn't needed).
+    - ENCODED: We have encoded the outermost message for transmission.
+
+    Unhappy path states:
+    - UNVERIFIABLE: We tried verifying the message, but don't have the public
+      key we need to validate the signature.
+    - UNDECIPHERABLE: We tried decrypting the message, but don't have the
+      symmetric key used to encrypt it.
+    - UNPARSEABLE: The data is gibberish.
+    """
+
+    # Happy path: incoming
+    UNDECODED = 0
+    OUTER_DECODED = 1
+    INNER_DECODED = 2
+    DECODED = 3
+
+    # Happy path: outgoing
+    UNENCODED = 10
+    CBOR_ENCODED = 11
+    ENCRYPTED = 12
+    ENCODED = 13
+
+    # Unhappy path: incoming
+    UNDECIPHERABLE = -2
+    UNPARSEABLE = -3
+
+
+class NodeMsg(object):
+    """
+    Container for the node message, wrapping layers and sender/receiver address.
+    """
+
+    @staticmethod
+    def extract_kid(msg):
+        """
+        Extract the KID field from the given message.
+        """
+        if isinstance(msg, Sign1Message):
+            # This is a signed message, find the KID in phdr
+            kid = msg.phdr[KID]
+        elif isinstance(msg, Enc0Message) or isinstance(msg, Mac0Message):
+            # This is an encrypted or MAC-protected message, find the KID
+            # in uhdr.
+            kid = msg.uhdr[KID]
+        else:
+            raise TypeError("Message is not a COSE Sign1, Enc0 or MAC0")
+
+        # Decode the KID
+        return KeyID.decode(kid)
+
+    def __init__(self, payload, msg):
+        self._payload = payload
+        self._msg = msg
+        self._created = time.time()
+
+    @property
+    def created(self):
+        """
+        Return the time that this message was created.
+        """
+        return self._created
+
+    @property
+    def state(self):
+        """
+        Return the state of the message.
+        """
+        return self._state
+
+    @property
+    def payload(self):
+        """
+        The raw UDP message payload bytes, prior to being decoded or after
+        encoding of the final outer message.
+        """
+        return self._payload
+
+    @property
+    def inner_payload(self):
+        """
+        The payload within the innermost message.
+        """
+        return self.inner.payload
+
+    @property
+    def msg(self):
+        """
+        The PVLAN message being decoded or encoded.
+        """
+        return self._msg
+
+
+class MissingKeyError(KeyError):
+    """
+    The message is missing a symmetric key needed for decryption.
+    """
+
+    def __init__(self, kid, msg):
+        super().__init__("Missing shared key %s" % kid)
+        self._kid = kid
+        self._msg = msg
+
+    @property
+    def kid(self):
+        return self._kid
+
+    @property
+    def msg(self):
+        return self._msg
+
+
+class IncomingNodeMsg(NodeMsg):
+    """
+    Storage for incoming messages during decoding.  This container stores the
+    various stages of message decoding so we can handle late arrival of
+    cryptographic material.
+    """
+
+    def __init__(self, addr, payload):
+        super().__init__(payload=payload, msg=None)
+        self._addr = addr
+        self._state = NodeMsgState.UNDECODED
+        self._outer_verified = False
+        self._inner_verified = False
+
+        self._cbordata = None
+        self._outer = None
+        self._inner = None
+
+        self._cert = None
+        self._sharedkey = None
+        self._sharedkeys = None
+
+    @property
+    def addr(self):
+        """
+        IP address where the message was received.
+        """
+        return self._addr
+
+    @property
+    def cert(self):
+        """
+        Certificate + public key used for SIGN1 validation.
+        """
+        return self._cert
+
+    @property
+    def sharedkey(self):
+        """
+        Symmetric key used for ENC0 decryption / MAC0 verification.
+        """
+        return self._sharedkey
+
+    @property
+    def verified(self):
+        """
+        Returns true if all validation checks have passed for this message.
+        """
+        if self.outer is None:
+            return False
+
+        if isinstance(self.outer, Sign1Message) and not self.outer_verified:
+            return False
+
+        if self.inner is None:
+            return False
+
+        return self.inner_verified
+
+    @property
+    def outer_verified(self):
+        """
+        Returns True if the outer Sign1 message has been verified.
+        Not relevant for pure Enc0 / Mac0 messages.
+        """
+        return self._outer_verified
+
+    @property
+    def inner_verified(self):
+        """
+        Returns True if the inner Enc0 / Mac0 message has been checked.
+        """
+        return self._inner_verified
+
+    @property
+    def outer(self):
+        """
+        The outermost message envelope, which will be a COSE Sign1 or Enc0.
+        """
+        return self._outer
+
+    @property
+    def outer_kid(self):
+        """
+        Return the KID used to sign or encrypt the outermost message.
+        """
+        if self.outer:
+            return self.extract_kid(self.outer)
+
+        # No outer message frame
+        return None
+
+    @property
+    def inner(self):
+        """
+        The innermost message envelope, which will either be a COSE Sign1
+        (the same one as ``outer`` actually) or a COSE Enc1.
+        """
+        return self._inner
+
+    @property
+    def inner_kid(self):
+        """
+        Return the KID used to sign or encrypt the innermost message.
+        """
+        if self.inner:
+            return self.extract_kid(self.inner)
+
+        # No inner message frame
+        return None
+
+    @property
+    def cbordata(self):
+        """
+        The CBOR data residing in the innermost message.
+        """
+        return self._cbordata
+
+    def decode_outer(self):
+        """
+        Decode the outermost COSE message, if possible.
+        """
+        # Decode the outer message
+        if self.outer is None:
+            try:
+                self._outer = CoseMessage.decode(self.payload)
+            except:
+                raise
+
+            # Success, what did we get?
+            if isinstance(self.outer, Sign1Message):
+                # This is a digitally signed message.
+                self._state = NodeMsgState.OUTER_DECODED
+            else:
+                # This is a Mac0 or Enc0, not signed.
+                # Outer = Inner
+                self._inner = self._outer
+                self._state = NodeMsgState.INNER_DECODED
+
+    def validate_outer(self, cert):
+        """
+        Validate the outer message with the given certificate.
+        """
+        if (not self.outer_verified) and isinstance(self.outer, Sign1Message):
+            # We have a public key, try to validate the Sign1 with it.
+            cert.pubkey.validate_sign1(self.outer)
+            # Success, the message is valid.
+            self._outer_verified = True
+
+    def decode(self, cert=None, sharedkey=None, sharedkeys=None):
+        """
+        Decode the full message, if we can.
+        """
+        # Decode the outer message
+        self.decode_outer()
+
+        # Validate the outer message if we have a certificate to do that with.
+        if cert is not None:
+            self.validate_outer(cert)
+
+        if self.inner is None:
+            # See if we can decode the inner.
+            try:
+                self._inner = CoseMessage.decode(self.outer.payload)
+                self._state = NodeMsgState.INNER_DECODED
+            except AttributeError:
+                # Raw CBOR?
+                self._decode_cbor(self.outer.payload)
+                # It is, so the outer is the innermost too
+                self._inner = self.outer
+
+        if self.cbordata is None:
+            # Pick up the key used on the inner message
+            kid = self.extract_kid(self.inner)
+            if (sharedkey is None) and (sharedkeys is not None):
+                sharedkey = sharedkeys.get(kid)
+
+            if isinstance(self.inner, Enc0Message) and (sharedkey is None):
+                # We can't proceed without the symmetric key!
+                raise MissingKeyError(kid, self)
+
+            # Validate the inner message
+            self._validate_inner(sharedkey)
+
+        if self.msg is None:
+            # Try to parse the embedded message
+            try:
+                self._msg = NodeMsgBase.decode(self)
+            except:
+                # Nope!
+                self._state = NodeMsgState.UNPARSEABLE
+                raise
+
+        return self.msg
+
+    def _validate_inner(self, sharedkey):
+        """
+        Attempt validation (MAC0) or decryption (ENC0) with the given key.
+        """
+        if isinstance(self.inner, Mac0Message):
+            sharedkey.key.validate_mac0(self.inner)
+        else:
+            assert isinstance(
+                self.inner, Enc0Message
+            ), "Not a MAC0 or ENC0, don't know how to proceed"
+            self._decode_cbor(sharedkey.key.decrypt_enc0(self.inner))
+
+        # This was it.
+        self._inner_verified = True
+        self._sharedkey = sharedkey
+
+    def _decode_cbor(self, cborbytes):
+        # Raw CBOR?
+        try:
+            self._cbordata = cbor2.loads(cborbytes)
+            self._state = NodeMsgState.DECODED
+        except:
+            # Nope!
+            self._state = NodeMsgState.UNPARSEABLE
+            raise
+
+
+class OutgoingNodeMsg(NodeMsg):
+    """
+    Storage for outgoing messages during encoding.
+    """
+
+    def __init__(self, msg):
+        super().__init__(msg=msg, payload=None)
+        self._state = NodeMsgState.UNENCODED
+        self._inner_payload = None
+        self._inner_kid = None
+        self._outer_payload = None
+        self._outer_kid = None
+
+    @property
+    def inner_payload(self):
+        """
+        The payload within the innermost message.
+        """
+        return self._inner_payload
+
+    @property
+    def inner_kid(self):
+        """
+        The key ID used to encode the innermost message.
+        """
+        return self._inner_kid
+
+    @property
+    def outer_payload(self):
+        """
+        The payload within the outermost message.
+        """
+        return self._outer_payload
+
+    @property
+    def outer_kid(self):
+        """
+        The key ID used to encode the outermost message.
+        """
+        return self._outer_kid
+
+    def encode(
+        self,
+        privkey=None,
+        kid=None,
+        sharedkey=None,
+        force_encrypt=False,
+        force_sign=False,
+    ):
+        """
+        Encode the inner message payload.
+        """
+        # Encode the message as CBOR
+        if self.inner_payload is None:
+            self._inner_payload = bytes(self.msg)
+            self._state = NodeMsgState.CBOR_ENCODED
+
+        # Encode the innermost ENC0 or MAC0
+        if self.outer_payload is None:
+            if force_encrypt or self.msg.ENCRYPTED:
+                # Message must be encrypted, create a ENC0
+                if sharedkey is None:
+                    raise ValueError("sharedkey is required for encryption")
+
+                if sharedkey.is_expired:
+                    raise ValueError("provided shared key is expired")
+
+                self._outer_payload = sharedkey.key.generate_enc0(
+                    self.inner_payload, kid=bytes(sharedkey.kid)
+                )
+                self._outer_kid = sharedkey.kid
+                sharedkey.count_packet()
+            elif self.msg.AUTHENTICATED:
+                # Message must be authenticated, create a MAC0
+                if sharedkey is None:
+                    raise ValueError(
+                        "sharedkey is required for authentication"
+                    )
+
+                if sharedkey.is_expired:
+                    raise ValueError("provided shared key is expired")
+
+                self._outer_payload = sharedkey.key.generate_mac0(
+                    self.inner_payload, kid=sharedkey.kid
+                )
+                self._outer_kid = sharedkey.kid
+                sharedkey.count_packet()
+            else:
+                # Message has just an outermost Sign1
+                self._outer_payload = self.inner_payload
+
+            self._state = NodeMsgState.ENCRYPTED
+
+        # Encode the outermost SIGN1
+        if self.payload is None:
+            if force_sign or self.msg.SIGNED:
+                if privkey is None:
+                    raise ValueError("privkey is required for signing")
+
+                if kid is None:
+                    raise ValueError("kid is required for signing")
+
+                self._payload = privkey.generate_sign1(
+                    self.outer_payload, kid=kid
+                )
+            else:
+                # No signing necessary
+                self._payload = self._outer_payload
+
+            self._state = NodeMsgState.ENCODED
+
+        # Return the encoded payload
+        return self.payload
+
+
 class NodeMsgBase(object):
     # Registry of node message type classes, for identification later
     _MSG_TYPES = {}
@@ -376,6 +841,9 @@ class NodeMsgBase(object):
 
     # Default setting: require this message be encrypted
     ENCRYPTED = True
+
+    # Default setting: we don't normally authenticate (with a MAC) a message
+    AUTHENTICATED = False
 
     @staticmethod
     def extract_kid(msg):
@@ -405,92 +873,22 @@ class NodeMsgBase(object):
         return typeclass
 
     @classmethod
-    def decode(cls, outermsg, skeystore, nodecert=None):
+    def decode(cls, incoming):
         """
-        Decode the message payload, up to two levels deep.
-        The following forms are permitted:
-        - Sign1 carrying CBOR:
-            No inner message, innermsg and outermsg reference the same object
-            Use cases:
-            - CA key solicitation/notifications
-            - ID solicitation/notifications
-            - peer key solicitation/notifications and related acknowledgements
-            - Sender key solicitation
-            - Request refusal notification
-        - Sign1 carrying a ENC0
-            Sign1 is outermsg
-            ENC0 is innermsg carrying CBOR
-            Use cases:
-            - Sender key notification
-            - Ethernet traffic notification (signing enabled)
-        - Bare ENC0 carrying CBOR
-            No inner message, innermsg and outermsg reference the same object
-            Use cases:
-            - Ethernet traffic notification (signing disabled)
-
-        Here, outermsg is the raw COSE sub-class, which must be either
-        a Sign1 or ENC0 message.
-
-        skeystore is a dict of all the symmetric keys sent by this node.  We
-        choose any matching key that is not expired in the event we have an
-        ENC0.
-
-        nodecert is the public key certificate of the sending node, None if
-        that is not yet known. (The message will not be validated if this is
-        not provided!)
+        Decode the incoming message.
         """
-
-        # outermsg is either a Sign1 or ENC0
-        if isinstance(outermsg, Sign1Message):
-            # Sign1: Should be signed with nodecert.pubkey
-            if nodecert is not None:
-                nodecert.pubkey.validate_sign1(outermsg)
-
-            # payload is either raw CBOR or a ENC0
-            try:
-                innermsg = CoseMessage.decode(outermsg.payload)
-                # We need the key to decrypt ENC0
-                payload = None
-            except AttributeError:
-                # Nope, this is raw CBOR
-                innermsg = outermsg
-                payload = outermsg.payload
-        elif isinstance(outermsg, Enc0Message):
-            # Enc0 message, pretend it's the "inner" message
-            innermsg = outermsg
-            # We need the key to decrypt ENC0
-            payload = None
-
-        # innermsg is either raw CBOR or an ENC0
-        if payload is None:
-            # innermsg should be an ENC0
-            if not isinstance(innermsg, Enc0Message):
-                raise ValueError("Inner message not a COSE Sign1")
-
-            # Retrieve its KID
-            enc_kid = cls.extract_kid(innermsg)
-
-            # Retrieve the key
-            enc_key = skeystore[enc_kid]
-            if enc_key.is_expired:
-                raise ValueError("ENC0 key has expired")
-
-            # Decrypt
-            payload = enc_key.key.decrypt_enc0(innermsg)
-
         # Decode the CBOR content
-        payload = cbor2.loads(payload)
-        if not isinstance(payload, list):
+        if not isinstance(incoming.cbordata, list):
             raise ValueError("Node message is malformed")
 
         # First element is the message type
-        msgtype = NodeMsgType(payload[0])
+        msgtype = NodeMsgType(incoming.cbordata[0])
 
         # Second is the request ID
-        rq_id = uuid.UUID(bytes=payload[1])
+        rq_id = uuid.UUID(bytes=incoming.cbordata[1])
 
         typeclass = cls._MSG_TYPES[msgtype]
-        return typeclass._decode(outermsg, innermsg, rq_id, payload[2:])
+        return typeclass._decode(incoming, rq_id, incoming.cbordata[2:])
 
     def __init__(self, rq_id):
         self._rq_id = rq_id
@@ -524,7 +922,7 @@ class NodeEthernetTrafficNotification(NodeMsgBase, Sequence):
     SIGNED = False
 
     @classmethod
-    def _decode(cls, outermsg, innermsg, rq_id, payload):
+    def _decode(cls, incoming, rq_id, payload):
         return cls(
             rq_id,
             [
@@ -576,7 +974,7 @@ class NodeRequestRefusalNotification(NodeMsgBase):
             return cls(rq_id=rq_id, code=500, message=str(exc))
 
     @classmethod
-    def _decode(cls, outermsg, innermsg, rq_id, payload):
+    def _decode(cls, incoming, rq_id, payload):
         code = int(payload[0])
         message = str(payload[1])
 
@@ -631,7 +1029,7 @@ class NodeMsgCASolicitation(NodeMsgBase, Sequence):
     ENCRYPTED = False
 
     @classmethod
-    def _decode(cls, outermsg, innermsg, rq_id, payload):
+    def _decode(cls, incoming, rq_id, payload):
         keylist = [KeyID.decode(kid) for kid in payload]
 
         return cls(rq_id, keylist)
@@ -668,7 +1066,7 @@ class NodeMsgCANotification(NodeMsgBase, Mapping):
     ENCRYPTED = False
 
     @classmethod
-    def _decode(cls, outermsg, innermsg, rq_id, payload):
+    def _decode(cls, incoming, rq_id, payload):
         certs = dict((KeyID.decode(kid), None) for kid in payload[0])
 
         for certdata in payload[1:]:
@@ -725,13 +1123,15 @@ class NodeMsgIDSolicitation(NodeMsgBase):
     ENCRYPTED = False
 
     @classmethod
-    def _decode(cls, outermsg, innermsg, rq_id, payload):
-        kid = KeyID.decode(outermsg.phdr[KID])
+    def _decode(cls, incoming, rq_id, payload):
+        kid = KeyID.decode(incoming.outer_kid)
+
         (
             name,
             certdata,
             authtoken,
         ) = payload[0:3]
+
         ca_keyids = set([KeyID.decode(kid) for kid in payload[3:]])
 
         if not isinstance(name, str):
@@ -814,7 +1214,7 @@ class NodeMsgPeerKeySolicitation(NodeMsgBase):
     ENCRYPTED = False
 
     @classmethod
-    def _decode(cls, outermsg, innermsg, rq_id, payload):
+    def _decode(cls, incoming, rq_id, payload):
         pubkey = SafeX25519PublicKey.from_bytes(payload[0])
 
         return cls(rq_id, pubkey)
@@ -861,7 +1261,7 @@ class NodeMsgPeerKeyNotification(NodeMsgBase):
     INFO_SZ = SafeDerivedKey.INFO_SZ
 
     @classmethod
-    def _decode(cls, outermsg, innermsg, rq_id, payload):
+    def _decode(cls, incoming, rq_id, payload):
         keysize = payload[0]
         if not isinstance(keysize, int):
             raise ValueError("Key size is not an integer")
@@ -978,7 +1378,7 @@ class NodeMsgPeerKeyVerificationSolicitation(NodeMsgBase):
     NONCE_SZ = NodeMsgPeerKeyNotification.NONCE_SZ
 
     @classmethod
-    def _decode(cls, outermsg, innermsg, rq_id, payload):
+    def _decode(cls, incoming, rq_id, payload):
         verification = payload[0]
 
         nonce = payload[1]
@@ -1026,7 +1426,7 @@ class NodeMsgPeerKeyVerificationNotification(NodeMsgBase):
     ENCRYPTED = False
 
     @classmethod
-    def _decode(cls, outermsg, innermsg, rq_id, payload):
+    def _decode(cls, incoming, rq_id, payload):
         verification = payload[0]
 
         return cls(rq_id, verification=verification)
@@ -1062,7 +1462,7 @@ class NodeMsgSenderKeySolicitation(NodeMsgBase, Sequence):
     MSG_TYPE = NodeMsgType.KEYS
 
     @classmethod
-    def _decode(cls, outermsg, innermsg, rq_id, payload):
+    def _decode(cls, incoming, rq_id, payload):
         keylist = [KeyID.decode(kid) for kid in payload]
 
         return cls(keylist, rq_id=rq_id)
@@ -1098,7 +1498,7 @@ class NodeMsgSenderKeyNotification(NodeMsgBase, Mapping):
     MSG_TYPE = NodeMsgType.KEYN
 
     @classmethod
-    def _decode(cls, outermsg, innermsg, rq_id, payload):
+    def _decode(cls, incoming, rq_id, payload):
         keys = dict((KeyID.decode(kid), None) for kid in payload[0])
 
         for keydata in payload[1:]:
@@ -1148,7 +1548,7 @@ class NodeMsgMACListenerSolicitation(NodeMsgBase, Set):
     MSG_TYPE = NodeMsgType.MLS
 
     @classmethod
-    def _decode(cls, outermsg, innermsg, rq_id, payload):
+    def _decode(cls, incoming, rq_id, payload):
         vlan = payload[0]
         maclist = [MAC.parse(macbytes) for macbytes in payload[1:]]
 
@@ -1209,7 +1609,7 @@ class NodeMsgMACListenerNotification(NodeMsgBase, Mapping):
             return MACSubscription(*sub)
 
     @classmethod
-    def _decode(cls, outermsg, innermsg, rq_id, payload):
+    def _decode(cls, incoming, rq_id, payload):
         return cls(
             rq_id=rq_id,
             maclifetimes=dict(
