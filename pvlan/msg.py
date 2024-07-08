@@ -10,7 +10,6 @@ PVLAN messaging
 import uuid
 import time
 import enum
-from collections import namedtuple
 from collections.abc import Mapping, Sequence, Set
 
 from pycose.headers import KID
@@ -46,9 +45,7 @@ ENC0_SZ_OVERHEAD = 66
 SIGN1_SZ_OVERHEAD = 99
 
 
-class MACSubscription(
-    namedtuple("MACSubscriptionBase", ["lifetime", "cost"])
-):
+class MACSubscription(Sequence):
     """
     Representation of MAC subscription parameters.
     """
@@ -59,21 +56,112 @@ class MACSubscription(
     MIN_COST = 0
     MAX_COST = 65535
 
-    def __init__(self, lifetime, cost=0):
+    @staticmethod
+    def _clamp(value, min_value, max_value):
+        return max(min(value, max_value), min_value)
+
+    @classmethod
+    def _clamp_lifetime(cls, lifetime):
+        return cls._clamp(lifetime, cls.MIN_LIFETIME, cls.MAX_LIFETIME)
+
+    @classmethod
+    def _clamp_cost(cls, cost):
+        return cls._clamp(cost, cls.MIN_COST, cls.MAX_COST)
+
+    @classmethod
+    def _get_lifetime(cls, expiry):
+        return int(expiry - time.time())
+
+    def __init__(self, lifetime=None, cost=None, expiry=None):
+        # If lifetime is a MACSubscription, clone it.
+        if isinstance(lifetime, self.__class__):
+            expiry = lifetime.expiry
+            cost = lifetime.cost or None
+            lifetime = lifetime.lifetime
+
+        # Ensure at least lifetime OR expiry is given
+        if lifetime is None:
+            # Compute from expiry
+            if not isinstance(expiry, int):
+                raise ValueError(
+                    "expiry must be an integer if lifetime not given"
+                )
+            lifetime = self._get_lifetime(expiry)
+
         # Sanitise and clamp inputs
         if not isinstance(lifetime, int):
             raise TypeError("lifetime must be an integer")
         else:
-            lifetime = min(
-                self.MAX_LIFETIME, max(lifetime, self.MIN_LIFETIME)
-            )
+            lifetime = self._clamp_lifetime(lifetime)
 
-        if not isinstance(cost, int):
+        if cost is None:
+            cost = self.MIN_COST
+        elif not isinstance(cost, int):
             raise TypeError("cost must be an integer")
         else:
-            cost = min(self.MAX_COST, max(cost, self.MIN_COST))
+            cost = self._clamp_cost(cost)
 
-        super().__init__(lifetime, cost)
+        # Store the cost as given
+        self._cost = cost
+
+        # Compute expiry for local use.  Don't use given expiry as we
+        # may have clamped the lifetime.
+        if lifetime > 0:
+            self._expiry = int(time.time() + lifetime)
+        else:
+            # Report expiry as 0 since it has passed
+            self._expiry = 0
+
+    @property
+    def lifetime(self):
+        """
+        Return the lifetime remaining for this subscription.
+        """
+        return self._clamp_lifetime(self._get_lifetime(self.expiry))
+
+    @property
+    def is_expired(self):
+        """
+        Return true if the subscription has expired.
+        """
+        return self.lifetime <= 0
+
+    @property
+    def cost(self):
+        """
+        Route cost in arbitrary cost units.
+        """
+        return self._cost
+
+    @property
+    def expiry(self):
+        """
+        Absolute expiry time for this subscription.
+        """
+        return self._expiry
+
+    @property
+    def as_cbor_array(self):
+        """
+        Encode this subscription as a CBOR array.
+        """
+        return [self.lifetime, self.cost]
+
+    def __iter__(self):
+        """
+        Iterate over the CBOR array representation.
+        """
+        return iter(self.as_cbor_array)
+
+    def __repr__(self):
+        """
+        Return a representation of the subscription.
+        """
+        return "%s(expiry=%d, cost=%d)" % (
+            self.__class__.__name__,
+            self.expiry,
+            self.cost,
+        )
 
 
 class EthernetFrameFragment(object):
