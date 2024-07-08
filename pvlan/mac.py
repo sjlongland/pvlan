@@ -131,6 +131,9 @@ class MAC(object):
     # Length of a node address
     NODEADDR_LEN = 3
 
+    # MAC for broadcast traffic (byte representation)
+    BROADCAST_NODEADDR_BYTES = bytes((0xFF, 0xFF, 0xFF))
+
     @classmethod
     def parse(cls, mac, reserve=False, register=True):
         """
@@ -270,11 +273,45 @@ class MAC(object):
         return self._oui
 
     @property
+    def is_global(self):
+        """
+        Return the global bit.  If set, this means the MAC is one of a range
+        officially allocated by the IEEE.
+        """
+        return self.oui.is_global
+
+    @property
+    def is_multicast(self):
+        """
+        Return the multicast bit.  If set, this means the MAC represents a
+        multicast group.
+        """
+        return self.oui.is_multicast
+
+    @property
+    def is_broadcast(self):
+        """
+        Return true if this is the broadcast OUI (FF:FF:FF).
+        """
+        return self.oui.is_broadcast and (
+            self._nodebytes == self.BROADCAST_NODEADDR_BYTES
+        )
+
+    @property
     def nodeaddr(self):
         """
         Return the node address for this MAC
         """
         return self._nodeaddr
+
+    def __eq__(self, other):
+        """
+        Determine if this is the same MAC as another.
+        """
+        if not isinstance(other, MAC):
+            return NotImplemented
+
+        return bytes(self) == bytes(other)
 
     def __int__(self):
         """
@@ -336,6 +373,9 @@ class MACOUI(object):
 
     # Length of an OUI in bytes
     OUI_LEN = 3
+
+    # OUI for broadcast traffic (byte representation)
+    BROADCAST_OUI_BYTES = bytes((0xFF, 0xFF, 0xFF))
 
     @staticmethod
     def decodestr(stroui):
@@ -453,6 +493,22 @@ class MACOUI(object):
         multicast group.
         """
         return self._is_multicast
+
+    @property
+    def is_broadcast(self):
+        """
+        Return true if this is the broadcast OUI (FF:FF:FF).
+        """
+        return self._ouibytes == self.BROADCAST_OUI_BYTES
+
+    def __eq__(self, other):
+        """
+        Determine if this is the same OUI as another.
+        """
+        if not isinstance(other, MACOUI):
+            return NotImplemented
+
+        return bytes(self) == bytes(other)
 
     def __bytes__(self):
         """
